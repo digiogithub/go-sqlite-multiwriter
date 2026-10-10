@@ -68,9 +68,11 @@ func (db *mwDB) publish(l *lane, v *validation, pgnos []uint32, imgs [][]byte, w
 	if v != nil {
 		ss.add(v.readPgnos)
 	}
+	db.gateEnter(l)
 	st.lockStripes(&ss)
 	release := func() {
 		st.unlockStripes(&ss)
+		db.gateExit()
 		if l != nil && l.holdsReloc {
 			l.holdsReloc = false
 			db.relocMu.Unlock()

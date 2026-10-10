@@ -2,6 +2,7 @@
 //
 //	go run ./cmd/mwbench -workload bulk -writers 1,4,16 -seconds 5
 //
+// Variants: sqlite (stock, WAL, BEGIN IMMEDIATE and a busy timeout), mw (the engine), mwr (the engine with the rebase).
 // Workloads: bulk (each writer inserts 100 rows per transaction into its own table), groups (each writer updates
 // its own row; the rows share pages), hot (every writer increments one of 4 rows: true conflicts).
 package main
@@ -29,7 +30,7 @@ func main() {
 	writersF := flag.String("writers", "1,4,16", "comma-separated writer counts")
 	seconds := flag.Float64("seconds", 5, "duration of each run")
 	dir := flag.String("dir", "", "directory for the database files (default: a temporary one)")
-	variants := flag.String("variants", "sqlite,mw", "sqlite and/or mw")
+	variants := flag.String("variants", "sqlite,mw,mwr", "sqlite, mw (the engine) and/or mwr (the engine with the rebase)")
 	flag.Parse()
 	d := *dir
 	if d == "" {
@@ -52,8 +53,8 @@ func main() {
 func open(variant, path string, writers int) *sql.DB {
 	var db *sql.DB
 	var err error
-	if variant == "mw" {
-		db, err = multiwriter.Open(path, multiwriter.Options{})
+	if variant == "mw" || variant == "mwr" {
+		db, err = multiwriter.Open(path, multiwriter.Options{Rebase: variant == "mwr"})
 	} else {
 		db, err = sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(10000)&_txlock=immediate")
 	}

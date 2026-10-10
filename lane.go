@@ -17,6 +17,8 @@ package multiwriter
 
 import (
 	"runtime"
+
+	"modernc.org/libc"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -108,10 +110,27 @@ type lane struct {
 
 	holdsReloc bool // this lane holds db.relocMu (released by publish right after its pages are installed)
 	ddlActive  bool // this lane owns the schema barrier (released when its transaction ends)
+
+	// the rebase (mw_rebase=1)
+	rebaseOn    bool
+	norebase    bool // this connection is itself a helper of the rebase: never recursive
+	rbNoBackoff bool
+	rbStreak    int
+	rbSkip      int
+	rb          *rbState
+	// what the statements of the transaction read (the statement hook)
+	rdCur     uintptr
+	rdCurKind int
+	rdDep     bool
+	rdDB      uintptr
+	rdChgBase int32
+	rdCache   map[string]rdEnt
+	cdb       atomic.Uintptr // the sqlite3* of the connection (dbLanes)
+	curTLS    *libc.TLS      // the TLS of the call into the VFS that commits
 }
 
 func newLane(db *mwDB) *lane {
-	return &lane{db: db, readcheck: true, hotCredit: defaultHotCredit, syncLevel: 2, wsIndex: map[uint32]int{}}
+	return &lane{db: db, readcheck: true, hotCredit: defaultHotCredit, syncLevel: 2, wsIndex: map[uint32]int{}, rdCache: map[string]rdEnt{}}
 }
 
 // MARK: - snapshots
@@ -525,6 +544,26 @@ func (l *lane) publish() int {
 			l.poisoned = true
 		} else if rr != errRelocNA {
 			rc = rr
+		} else if l.canRebase(pg1, cookie) {
+			// a physical conflict only on pages that it wrote: replay its row changes at the latest snapshot
+			e, rb := l.rebase(l.curTLS, imgs, cookie)
+			if rb == rcOK {
+				epoch, rc = e, rcOK
+				l.rbStreak = 0
+				// the pages that were published are the helper's, not the images in this lane's WAL: another commit of
+				// this snapshot would build on its own (as after a relocation)
+				l.poisoned = true
+			} else {
+				// refused: the next conflicts of this connection are probably true ones too: they are not replayed,
+				// 1, 3, 7... in a row
+				if !l.rbNoBackoff {
+					l.rbStreak = min(l.rbStreak+1, 5)
+					l.rbSkip = 1<<l.rbStreak - 1
+				}
+				if rb != errConflict {
+					rc = rb
+				}
+			}
 		}
 	}
 	switch rc {
@@ -546,7 +585,7 @@ func (l *lane) publish() int {
 		l.tx.state = TxAborted
 		db.nAborts.Add(1)
 		l.consecAborts++
-		if rc == errConflict && l.consecAborts >= 16 {
+		if rc == errConflict && l.consecAborts >= 16 && !l.norebase {
 			l.retryCredit = l.hotCredit
 		}
 		return rcBusySnapshot

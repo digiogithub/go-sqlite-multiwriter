@@ -1,9 +1,20 @@
 package multiwriter
 
 import (
+	"fmt"
 	"math/bits"
+	"os"
 	"time"
 )
+
+// MW_DEBUG=1 prints why the engine refuses what it refuses.
+var debugOn = os.Getenv("MW_DEBUG") != ""
+
+func debugf(format string, args ...any) {
+	if debugOn {
+		fmt.Fprintf(os.Stderr, "multiwriter: "+format+"\n", args...)
+	}
+}
 
 // SQLite result codes used by the engine.
 const (

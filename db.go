@@ -36,6 +36,15 @@ type mwDB struct {
 	p1Cache      []byte     // the page 1 the last relocation installed, and its epoch (relocMu)
 	p1CacheEpoch uint64
 
+	// the rebase: the queue of the group replay, and the publication gate
+	rbMu        sync.Mutex
+	rbCond      *sync.Cond
+	rbQueue     []*rbReq
+	rbLeader    bool
+	gateClosing atomic.Int32
+	gateActive  atomic.Int32
+	gateOwner   atomic.Pointer[lane]
+
 	hotHeld  atomic.Int32 // the hot-spot turn
 	ddlOwner atomic.Pointer[lane]
 
@@ -53,6 +62,7 @@ type mwDB struct {
 	nCommits, nAborts, nSnapshots, nPageConflicts, nReadConflicts, nSchemaConflicts atomic.Int64
 	nRelocations, nMerges, nReadsSaved, nCompactions, nCompactedPages, nLogSyncs    atomic.Int64
 	nHotSerialised, nBackpressure, nPagesPublished                                  atomic.Int64
+	nRebases, nRebaseGrouped, nRebaseRetries, nUnrebasable                          atomic.Int64
 }
 
 var (
@@ -69,6 +79,7 @@ func acquireDB(path string) *mwDB {
 	}
 	db := &mwDB{path: path, refs: 1, active: map[*lane]struct{}{}}
 	db.visCond = sync.NewCond(&db.visMu)
+	db.rbCond = sync.NewCond(&db.rbMu)
 	db.epoch.Store(1) // epoch 1 = the state found on disk at the first open
 	db.nextEpoch.Store(1)
 	db.schemaGen.Store(1)

@@ -297,6 +297,9 @@ func vfsOpen(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32, pOut uintpt
 	l.nomerge = uriBool(tls, zName, "mw_nomerge", false)
 	l.noroute = uriBool(tls, zName, "mw_noroute", false)
 	l.hotCredit = int(uriInt(tls, zName, "mw_hot_credit", defaultHotCredit))
+	l.norebase = uriBool(tls, zName, "mw_norebase", false)
+	l.rebaseOn = uriBool(tls, zName, "mw_rebase", false) && !l.norebase
+	l.rbNoBackoff = !uriBool(tls, zName, "mw_rebase_backoff", true)
 	if rc := openMain(tls, real, db, path); rc != rcOK {
 		realClose(tls, real)
 		releaseDB(db)
@@ -319,32 +322,35 @@ func vfsOpen(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32, pOut uintpt
 
 // MARK: - the statement hook
 
-// Custom file controls sent by the statement hook to the lane of the connection.
 const (
-	fcntlDDLBegin       = 0x4d570001
-	fcntlDDLReleaseIdle = 0x4d570002
-	traceStmt           = 0x01
-	traceProfile        = 0x02
+	traceStmt    = 0x01
+	traceProfile = 0x02
 )
 
 var (
 	hookOnce  sync.Once
 	autoExtFn = connectionInit
 	traceFn   = traceCallback
-	zMain     uintptr
 )
 
 // registerHook installs, once, an auto-extension that puts the statement hook on every connection opened from then
 // on (auto-extensions run right after xOpen inside sqlite3_open_v2, so the first engine open is in time for it).
 func registerHook(tls *libc.TLS) {
 	hookOnce.Do(func() {
-		zMain, _ = libc.CString("main")
 		sqlite3.Xsqlite3_auto_extension(tls, *(*uintptr)(unsafe.Pointer(&autoExtFn)))
 	})
 }
 
+// connectionInit puts the statement hook on a connection; on a mw_rebase=1 connection it also notes what the
+// statements of a transaction read (ctx 1).
 func connectionInit(tls *libc.TLS, db, pzErr, pApi uintptr) int32 {
-	sqlite3.Xsqlite3_trace_v2(tls, db, traceStmt|traceProfile, *(*uintptr)(unsafe.Pointer(&traceFn)), 0)
+	ctx := uintptr(0)
+	if fn := sqlite3.Xsqlite3_db_filename(tls, db, zMainName()); fn != 0 {
+		if uriBool(tls, fn, "mw_rebase", false) && !uriBool(tls, fn, "mw_norebase", false) {
+			ctx = 1
+		}
+	}
+	sqlite3.Xsqlite3_trace_v2(tls, db, traceStmt|traceProfile, *(*uintptr)(unsafe.Pointer(&traceFn)), ctx)
 	return rcOK
 }
 
@@ -403,14 +409,23 @@ func traceCallback(tls *libc.TLS, typ uint32, ctx, p, x uintptr) int32 {
 	if typ != traceStmt && typ != traceProfile {
 		return 0
 	}
+	if ctx != 0 {
+		if l := laneOfDB(tls, sqlite3.Xsqlite3_db_handle(tls, p)); l != nil {
+			l.stmtNote(tls, typ == traceProfile, p)
+		}
+	}
 	if !isDDL(sqlite3.Xsqlite3_sql(tls, p)) {
 		return 0
 	}
-	op := int32(fcntlDDLBegin)
-	if typ == traceProfile {
-		op = fcntlDDLReleaseIdle
+	l := laneOfDB(tls, sqlite3.Xsqlite3_db_handle(tls, p))
+	if l == nil {
+		return 0
 	}
-	sqlite3.Xsqlite3_file_control(tls, sqlite3.Xsqlite3_db_handle(tls, p), zMain, op, 0)
+	if typ == traceStmt {
+		l.ddlBegin()
+	} else if l.ddlActive && !l.snapHeld {
+		l.ddlEnd()
+	}
 	return 0
 }
 
@@ -568,6 +583,10 @@ func lmClose(tls *libc.TLS, p uintptr) int32 {
 	if l.ddlActive {
 		l.ddlEnd()
 	}
+	l.rebaseFree()
+	if db := l.cdb.Load(); db != 0 {
+		dbLanes.CompareAndDelete(db, l)
+	}
 	tlsMu.Lock()
 	for t, x := range tlsLanes {
 		if x == l {
@@ -656,13 +675,8 @@ func lmFileControl(tls *libc.TLS, p uintptr, op int32, arg uintptr) int32 {
 	l := f.lane
 	noteLane(tls, l)
 	switch op {
-	case fcntlDDLBegin:
-		l.ddlBegin()
-		return rcOK
-	case fcntlDDLReleaseIdle:
-		if l.ddlActive && !l.snapHeld {
-			l.ddlEnd()
-		}
+	case fcntlLaneHandle:
+		*(*uintptr)(unsafe.Pointer(arg)) = *(*uintptr)(unsafe.Pointer(p + 8))
 		return rcOK
 	case sqlite3.SQLITE_FCNTL_MMAP_SIZE:
 		*(*int64)(unsafe.Pointer(arg)) = 0 // reads must go through xRead
@@ -783,7 +797,9 @@ func walReadM(tls *libc.TLS, p, buf uintptr, n int32, off int64) int32 {
 }
 
 func walWriteM(tls *libc.TLS, p, buf uintptr, n int32, off int64) int32 {
-	return int32(fileOf(p).lane.walWrite(bytesAt(buf, int(n)), off))
+	l := fileOf(p).lane
+	l.curTLS = tls
+	return int32(l.walWrite(bytesAt(buf, int(n)), off))
 }
 
 func walTruncateM(tls *libc.TLS, p uintptr, size int64) int32 {

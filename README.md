@@ -52,6 +52,10 @@ escritor 3 --> WAL privado --+    (gana el primero en confirmar)                
 * **Durabilidad.** Cada commit se escribe en un log segmentado (`<db>-mw`, `<db>-mw.000001`...) con *group
   commit* (`synchronous=FULL` por defecto: el commit está en disco cuando vuelve). El log se compacta en el
   `.db` en segundo plano. Tras un crash, la recuperación reproduce el prefijo válido del log.
+* **Rebase** (`mw_rebase=1`, opcional). Dos escritores que cambian filas distintas pueden caer en la misma
+  página. Con el rebase, el commit que pierde no se rechaza: se decodifican sus cambios de fila directamente de
+  las páginas y se re-ejecutan con SQL normal en una conexión auxiliar sobre el estado más reciente (agrupando
+  varias peticiones en una transacción). Si la fila cambió entretanto (conflicto real) se rechaza como antes.
 * **Barrera de esquema.** Un `CREATE/DROP/ALTER/...` (detectado con `sqlite3_trace_v2`) espera a que terminen
   los escritores en vuelo y bloquea nuevos mientras corre.
 
@@ -66,7 +70,7 @@ Aislamiento: *snapshot isolation* con *first-committer-wins* por página más va
 | Reubicación de páginas nuevas, fusión de páginas interiores, atajo de enrutado | ✅ |
 | Log durable con group commit, recuperación tras crash, compactación, GC | ✅ |
 | Barrera DDL, turno para zonas calientes, pragmas no soportados rechazados | ✅ |
-| **Rebase** (`mw_rebase=1`: re-ejecutar cambios de fila cuando el conflicto es sólo de página) | ⏳ fase 2 |
+| **Rebase** (`mw_rebase=1`): decodificación de filas, catálogo, sentencias "puntuales" por bytecode, re-ejecución agrupada, compuerta de publicación | ✅ |
 | **Multiproceso** (`mw_mp=1`: índice compartido y log en memoria compartida) | ⏳ fase 3 (hoy: un proceso por base; un segundo proceso recibe `SQLITE_BUSY`) |
 
 Los ficheros `-mw*` no son compatibles en formato con los del original en C (no hace falta: sólo existen
@@ -74,23 +78,30 @@ mientras la base está abierta; al cerrar la última conexión todo queda en el 
 
 ## Rendimiento
 
-`go run ./cmd/mwbench -workload bulk -writers 1,4,16` — máquina de 4 núcleos, disco, `synchronous=FULL`, ambos
-con modernc (SQLite de serie en WAL con `BEGIN IMMEDIATE` y `busy_timeout`):
+`go run ./cmd/mwbench -workload bulk|groups|hot -writers 1,4,16` — máquina de 4 núcleos, disco local,
+`synchronous=FULL`, todo con modernc. `sqlite` = SQLite de serie en WAL con `BEGIN IMMEDIATE` y `busy_timeout`;
+`mw` = el motor; `mwr` = el motor con rebase. "reint." = reintentos de la aplicación por cada 100 transacciones.
 
-| bulk (100 inserts/tx, cada escritor su tabla) | SQLite tx/s | multiwriter tx/s | SQLite p99.9 | multiwriter p99.9 |
-|---:|---:|---:|---:|---:|
-| 1 escritor | 1262 | 1060 | 7 ms | 4 ms |
-| 4 escritores | 1068 | **1902** | 1033 ms | **15 ms** |
-| 16 escritores | 1054 | **1814** | 4036 ms | **39 ms** |
+| carga | escritores | SQLite tx/s | mw tx/s | mwr tx/s | SQLite p99.9 | mwr p99.9 |
+|---|---:|---:|---:|---:|---:|---:|
+| **bulk** (100 inserts/tx, tabla propia) | 4 | 1.163 | **1.824** | 1.719 | 1.133 ms | 23 ms |
+| | 16 | 1.129 | **1.747** | 1.722 | 4.040 ms | 42 ms |
+| **groups** (cada uno su fila, misma página) | 4 | 4.282 | 4.131 (380 reint.) | **4.877** (0 reint.) | 3 ms | 5 ms |
+| | 16 | 4.278 | 3.686 (354 reint.) | **9.506** (0 reint.) | 1.131 ms | **9,5 ms** |
+| **hot** (4 filas compartidas: conflicto real) | 16 | **4.542** | 3.755 | 3.260 | 1.131 ms | 126 ms |
 
-Cuando todos los escritores tocan **la misma página** (filas pequeñas vecinas, contadores calientes) el
-rendimiento es similar al de SQLite pero con reintentos; ese es el caso que resuelve el *rebase* (fase 2).
+* Con varios escritores el throughput sube 1,5–2,2× y, sobre todo, la latencia de cola cae de segundos a
+  milisegundos (SQLite serializa a los escritores tras un único lock).
+* Con un solo escritor el coste es similar a SQLite (±15 %).
+* Cuando varios escritores cambian **la misma fila** no hay nada que fusionar: se serializan y reintentan.
 
 ## Opciones (URI)
 
 | Parámetro | Significado |
 |---|---|
 | `vfs=multiwriter` | activa el motor (`mw=0` lo desactiva para esa base) |
+| `mw_rebase=1` | re-ejecuta un commit que sólo perdió por compartir página (`Options.Rebase`) |
+| `mw_rebase_backoff=0` | re-ejecuta todos los conflictos (por defecto, tras un rechazo se saltan 1, 3, 7… para no gastar en filas calientes) |
 | `mw_readcheck=0` | no validar las páginas leídas: menos reintentos, pero permite *write skew* |
 | `mw_log_max_mb` | tamaño del log antes de compactar (32 MB) |
 | `mw_base_cache_mb` | caché de páginas del fichero en memoria (64 MB) |
@@ -104,6 +115,11 @@ rendimiento es similar al de SQLite pero con reintentos; ese es el caso que resu
   están en el `.db`).
 * Una transacción que falla con `SQLITE_BUSY_SNAPSHOT` debe repetirse **entera** (`RunTx` lo hace).
 * Un lector que nunca termina impide compactar (igual que en el original).
+* El rebase sólo se aplica a transacciones "a ciegas": `INSERT ... VALUES` y `UPDATE`/`DELETE` de una fila por
+  su clave, sin `SELECT` previo (un `SELECT` seguido de `UPDATE` se reintenta: evita *write skew*). No se aplica con
+  DDL, triggers, tablas virtuales, `AUTOINCREMENT`, claves foráneas circulares, codificación no UTF-8, ni si la
+  aplicación instala su propio `sqlite3_trace_v2`. Dos `INSERT` sin clave explícita en la misma tabla eligen el
+  mismo `rowid` y cuentan como conflicto real. `MW_DEBUG=1` muestra por qué se rechaza algo.
 
 ## Tests
 

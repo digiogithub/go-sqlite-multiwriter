@@ -55,6 +55,9 @@ type Options struct {
 	// ReadCheck=false turns the validation of the pages a transaction read off: fewer retries, but write skew becomes
 	// possible (mw_readcheck=0).
 	DisableReadCheck bool
+	// Rebase replays a commit that lost only on shared pages (other rows of the same page) at the latest state
+	// instead of refusing it (mw_rebase=1).
+	Rebase bool
 	// LogMaxMB is the size of the log before it is compacted into the database file (32 MB by default).
 	LogMaxMB int
 	// MaxOpenConns limits the pool of database/sql (0: unlimited).
@@ -71,6 +74,9 @@ func DSN(path string, o Options) string {
 	}
 	q := url.Values{}
 	q.Set("vfs", VFSName)
+	if o.Rebase {
+		q.Set("mw_rebase", "1")
+	}
 	if o.DisableReadCheck {
 		q.Set("mw_readcheck", "0")
 	}
@@ -170,6 +176,10 @@ type Stats struct {
 	VersionsReclaims int64
 	GCRuns           int64
 	Backpressure     int64
+	Rebases          int64 // commits saved by the rebase
+	RebasesGrouped   int64 // of them, in a group replay of two or more
+	RebaseRetries    int64 // replays that lost a race and ran again
+	Unrebasable      int64 // conflicts the rebase could not replay (refused as without it)
 }
 
 func dbFor(path string) *mwDB {
@@ -199,6 +209,7 @@ func GetStats(path string) (Stats, bool) {
 	if db.log != nil {
 		s.BaseEpoch, s.LogBytes, s.LogSyncs = db.log.baseEpoch(), db.log.bytes(), db.log.nSyncs.Load()
 	}
+	s.Rebases, s.RebasesGrouped, s.RebaseRetries, s.Unrebasable = db.nRebases.Load(), db.nRebaseGrouped.Load(), db.nRebaseRetries.Load(), db.nUnrebasable.Load()
 	st := db.store
 	s.PageVersions, s.BytesRetained, s.VersionsReclaims, s.GCRuns = st.versions.Load(), st.bytes.Load(), st.reclaimed.Load(), st.gcRuns.Load()
 	return s, true
