@@ -384,7 +384,9 @@ func (lg *wlog) replay(ids []uint32, base uint64, st *store) (uint64, int) {
 			if err := f.Sync(); err != nil {
 				return 0, rcIOErrFsync
 			}
-			stopped = true
+			// The zero padding at the end of a full multi-process segment is not a torn tail: the log goes on in
+			// the next segment when its first record is the next epoch.
+			stopped = !lg.continuesIn(id+1, prev)
 		}
 		seg.end = off
 		seg.ready.Store(off)
@@ -649,4 +651,22 @@ func (lg *wlog) close(remove bool) {
 		os.Remove(lg.path)
 	}
 	lg.closeFiles()
+}
+
+// continuesIn reports whether segment id exists and starts with the record of epoch prev+1.
+func (lg *wlog) continuesIn(id uint32, prev uint64) bool {
+	f, err := os.Open(segPath(lg.path, id))
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	h := make([]byte, segHdrSize+recHdrSize)
+	if n, _ := f.ReadAt(h, 0); n < len(h) {
+		return false
+	}
+	if string(h[:8]) != segMagic || binary.LittleEndian.Uint32(h[8:]) != id || binary.LittleEndian.Uint64(h[16:]) != lg.salt {
+		return false
+	}
+	rh := h[segHdrSize:]
+	return binary.LittleEndian.Uint32(rh[0:]) == recMagic && binary.LittleEndian.Uint64(rh[8:]) == prev+1
 }

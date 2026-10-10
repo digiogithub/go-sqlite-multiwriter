@@ -344,9 +344,11 @@ func (m *mpState) oldest() uint64 {
 
 // MARK: - the log
 
+// prepPaths lists the prefilled segments, including a ".prep.tmp" left by a process killed while preparing one.
 func prepPaths(base string) []string {
 	m, _ := filepath.Glob(base + ".*.prep")
-	return m
+	t, _ := filepath.Glob(base + ".*.prep.tmp")
+	return append(m, t...)
 }
 
 func (m *mpState) file(id uint32) (*os.File, error) {

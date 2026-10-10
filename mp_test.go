@@ -108,6 +108,22 @@ func mpChild(role string) int {
 			rc = 3
 		}
 		return rc
+	case "bigloop":
+		ack, _ := os.OpenFile(os.Getenv("MW_MP_ACK"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+		for i := 0; ; i++ {
+			err := RunTx(ctx, db, nil, func(tx *sql.Tx) error {
+				if _, err := tx.Exec(fmt.Sprintf("INSERT INTO t%d(v) VALUES(?)", id), strings.Repeat("z", 120000)); err != nil {
+					return err
+				}
+				_, err := tx.Exec("UPDATE c SET n = n + 1 WHERE id = ?", id)
+				return err
+			})
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "child", id, err)
+				return 3
+			}
+			ack.WriteString("1\n")
+		}
 	case "hold":
 		// keeps the database open (and a snapshot) until killed
 		tx, _ := db.Begin()
@@ -387,4 +403,35 @@ func TestMPBulkGrowth(t *testing.T) {
 			t.Fatalf("t%d: %d rows, %v", w, n, err)
 		}
 	}
+}
+
+func TestMPAllKilledBig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.db")
+	const P = 3
+	db := mpSetup(t, path, P)
+	db.Close()
+	var cmds []*exec.Cmd
+	for p := 0; p < P; p++ {
+		cmds = append(cmds, spawn(t, "bigloop", path, p, 0, "MW_MP_ACK="+filepath.Join(dir, fmt.Sprintf("ack%d", p))))
+	}
+	time.Sleep(3000 * time.Millisecond)
+	for _, c := range cmds {
+		c.Process.Signal(syscall.SIGKILL)
+		c.Wait()
+	}
+	t.Logf("sidecars: %v", sidecars(path))
+	db = openT(t, path, mpOpts())
+	defer db.Close()
+	for p := 0; p < P; p++ {
+		var n, rows int
+		db.QueryRow("SELECT n FROM c WHERE id = ?", p).Scan(&n)
+		db.QueryRow(fmt.Sprintf("SELECT count(*) FROM t%d", p)).Scan(&rows)
+		acked := countAcks(filepath.Join(dir, fmt.Sprintf("ack%d", p)))
+		t.Logf("process %d: counter %d rows %d acknowledged %d", p, n, rows, acked)
+		if n < acked || rows < acked {
+			t.Errorf("process %d: counter %d rows %d, acknowledged %d", p, n, rows, acked)
+		}
+	}
+	integrity(t, db)
 }
