@@ -53,6 +53,14 @@ writer 3 --> private WAL --+    (first committer wins)                       (co
 * **Durability.** Every commit goes into a segmented log (`<db>-mw`, `<db>-mw.000001`...) with group commit
   (`synchronous=FULL` by default: the commit is on disk when it returns). The log is compacted into the `.db` in
   the background. After a crash, recovery replays the valid prefix of the log.
+* **Visible, then durable.** A commit becomes visible to new snapshots as soon as its record is written, while
+  its fsync runs; its own `COMMIT` returns once it is on the disk. A snapshot taken during that fsync would
+  otherwise be stale and bound to lose on any shared page: with 16 writers on the same pages this alone is 3–4×
+  the throughput. An acknowledged commit never depends on one that could be lost (a commit that read another one
+  is acknowledged only after an fsync round that started after that one was written, and a failed fsync fails
+  every later commit). The one difference with stock SQLite: after a power failure, a *read-only* transaction may
+  have seen a commit whose `COMMIT` never returned. `mw_durable_visible=1` (`Options.DurableVisibility`) restores
+  the strict order. The multi-process mode always works this way.
 * **Rebase** (`mw_rebase=1`, optional). Two writers changing different rows can land on the same page. With the
   rebase, the losing commit is not refused: its row changes are decoded straight from the pages and replayed with
   ordinary SQL on a helper connection at the latest state (several requests batched into one transaction). If the
@@ -90,18 +98,25 @@ the database is open; when the last connection closes everything is in the `.db`
 `busy_timeout`; `mw` = the engine; `mwr` = the engine with rebase. "retries" = application retries per 100
 transactions.
 
-| workload | writers | SQLite tx/s | mw tx/s | mwr tx/s | SQLite p99.9 | mwr p99.9 |
-|---|---:|---:|---:|---:|---:|---:|
-| **bulk** (100 inserts/tx, own table) | 4 | 1,163 | **1,824** | 1,719 | 1,133 ms | 23 ms |
-| | 16 | 1,129 | **1,747** | 1,722 | 4,040 ms | 42 ms |
-| **groups** (each its own row, same page) | 4 | 4,282 | 4,131 (380 retries) | **4,877** (0 retries) | 3 ms | 5 ms |
-| | 16 | 4,278 | 3,686 (354 retries) | **9,506** (0 retries) | 1,131 ms | **9.5 ms** |
-| **hot** (4 shared rows: real conflict) | 16 | **4,542** | 3,755 | 3,260 | 1,131 ms | 126 ms |
+| workload | writers | SQLite tx/s | mw tx/s | mwr tx/s | SQLite p99.9 | mw p99.9 | mwr p99.9 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **bulk** (100 inserts/tx, own table) | 1 | **1,280** | 1,150 | 957 | 5 ms | 5 ms | 5 ms |
+| | 4 | 944 | **1,811** | 1,773 | 663 ms | 16 ms | 16 ms |
+| | 16 | 1,154 | **1,697** | 1,674 | 4,246 ms | 27 ms | 24 ms |
+| **groups** (each its own row, same page) | 1 | **4,609** | 4,459 | 3,822 | 2.5 ms | 2.5 ms | 3 ms |
+| | 4 | 4,257 | **7,356** (33 retries) | 6,392 (0 retries) | 2.9 ms | 5.7 ms | 5.4 ms |
+| | 16 | 4,089 | **14,956** (117 retries) | 9,893 (0 retries) | 1,431 ms | 38 ms | 9.4 ms |
+| **hot** (4 shared rows: real conflict) | 1 | **4,862** | 4,422 | 3,960 | 2 ms | 3 ms | 3.4 ms |
+| | 4 | 4,651 | **7,874** (32 retries) | 7,753 | 2.4 ms | 4.9 ms | 4.5 ms |
+| | 16 | 4,971 | **16,074** (115 retries) | 12,690 | 1,431 ms | 32 ms | 23 ms |
 
-* With several writers throughput rises 1.5–2.2× and, above all, tail latency drops from seconds to
+* With several writers throughput rises 1.5–3.7× and, above all, tail latency drops from seconds to
   milliseconds (SQLite serialises the writers behind a single lock).
-* With a single writer the cost is close to SQLite (±15 %).
-* When several writers change **the same row** there is nothing to merge: they serialise and retry.
+* With a single writer the cost is close to SQLite (±10 %).
+* The rebase trades throughput for no retries at all: with commits visible before their fsync a retry is cheap and
+  plain `mw` is faster; the rebase pays when a transaction is expensive to run again in the application.
+* With `mw_durable_visible=1` (strict order) the contended workloads fall back to about SQLite's throughput
+  (`groups`/`hot` with 16 writers: about 4,000 tx/s and 360 retries per 100 transactions); `bulk` does not change.
 
 **Multi-process** (`go run ./cmd/mwbench -procs 4 -variants sqlite,mwp,mwpr ...`: the writers spread over 4
 processes; `mwp` = the engine in multi-process mode, `mwpr` = the same with rebase; stock SQLite shares the database
@@ -118,9 +133,9 @@ between processes natively):
 
 * Across processes the engine doubles SQLite on growing tables and gives 1.4–2× on small transactions, with the
   tail latency in tens of milliseconds instead of seconds.
-* In a single process, the multi-process mode costs nothing measurable (one writer: 3,991 vs 4,596 tx/s on
-  `groups`, within the noise of the fsync) and is even faster than the default mode on contended rows (16 writers,
-  `hot`: 10,374 vs 3,933 tx/s, with 3.5× fewer retries).
+* In a single process the multi-process mode costs nothing measurable with one writer (3,991 vs 4,459 tx/s on
+  `groups`, within the noise of the fsync); with many writers on the same pages the default mode is faster
+  (16 writers, `hot`: 16,074 vs 10,374 tx/s), since its publication is not serialised by a lock.
 
 ## Multi-process
 
@@ -146,6 +161,7 @@ over all processes.
 | `mw_rebase=1` | replays a commit that lost only because it shared a page (`Options.Rebase`) |
 | `mw_rebase_backoff=0` | replays every conflict (by default, after a refusal 1, 3, 7… are skipped so as not to waste work on hot rows) |
 | `mw_mp=1` | multi-process mode (`Options.MultiProcess`) |
+| `mw_durable_visible=1` | a commit becomes visible only once it is on the disk, like stock SQLite (`Options.DurableVisibility`) |
 | `mw_readcheck=0` | do not validate the pages read: fewer retries, but allows write skew |
 | `mw_log_max_mb` | log size before compaction (32 MB) |
 | `mw_base_cache_mb` | in-memory cache of the pages of the file (64 MB) |

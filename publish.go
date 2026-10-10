@@ -170,7 +170,12 @@ func (db *mwDB) publish(l *lane, v *validation, pgnos []uint32, imgs [][]byte, w
 		db.wakeAllVisibility()
 		return 0, rc
 	}
-	if sync {
+	// Visible, then durable: the next snapshots see the commit while its fsync runs (a snapshot taken before it is
+	// visible is bound to lose against it on a shared page). A commit that read this one is acknowledged only after
+	// an fsync round that started after this record was written, so it never outlives this one in the log; the
+	// compactor syncs the log before it copies pages. mw_durable_visible=1 keeps the order of stock SQLite.
+	durableFirst := sync && db.durableVis.Load()
+	if durableFirst {
 		if rc := db.log.sync(); rc != rcOK {
 			db.failed.Store(true) // outcome uncertain: stop accepting commits
 			db.wakeAllVisibility()
@@ -179,6 +184,13 @@ func (db *mwDB) publish(l *lane, v *validation, pgnos []uint32, imgs [][]byte, w
 	}
 	if rc := db.makeVisible(epoch); rc != rcOK {
 		return 0, rc
+	}
+	if sync && !durableFirst {
+		if rc := db.log.sync(); rc != rcOK {
+			db.failed.Store(true) // visible already, outcome uncertain: stop accepting commits
+			db.wakeAllVisibility()
+			return 0, rc
+		}
 	}
 
 	// the log only shrinks through compaction: ask the compactor, and throttle if it cannot keep up

@@ -61,7 +61,8 @@ type mwDB struct {
 	logMaxBytes   atomic.Int64
 	gcInterval    atomic.Int64
 	pubSinceGC    atomic.Int64
-	gcMu          sync.Mutex // one collection at a time; held by a multi-process compaction while it copies pages
+	durableVis    atomic.Bool // a commit becomes visible only once it is on the disk (mw_durable_visible=1)
+	gcMu          sync.Mutex  // one collection at a time; held by a multi-process compaction while it copies pages
 
 	// statistics
 	nCommits, nAborts, nSnapshots, nPageConflicts, nReadConflicts, nSchemaConflicts atomic.Int64

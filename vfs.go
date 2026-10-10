@@ -293,6 +293,9 @@ func vfsOpen(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32, pOut uintpt
 	db := acquireDB(path)
 	l := newLane(db)
 	l.readcheck = uriBool(tls, zName, "mw_readcheck", true)
+	if uriBool(tls, zName, "mw_durable_visible", false) {
+		db.durableVis.Store(true) // (for the whole database: the rebase helper publishes for every connection)
+	}
 	l.noreloc = uriBool(tls, zName, "mw_noreloc", false)
 	l.nomerge = uriBool(tls, zName, "mw_nomerge", false)
 	l.noroute = uriBool(tls, zName, "mw_noroute", false)

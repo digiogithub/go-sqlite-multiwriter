@@ -55,6 +55,11 @@ type Options struct {
 	// ReadCheck=false turns the validation of the pages a transaction read off: fewer retries, but write skew becomes
 	// possible (mw_readcheck=0).
 	DisableReadCheck bool
+	// DurableVisibility makes a commit visible to other transactions only once it is on the disk, like stock SQLite
+	// (mw_durable_visible=1). By default a commit is visible as soon as it is published and its own COMMIT returns
+	// once it is durable: concurrent writers start from fresher snapshots and lose far fewer commits, but after a power
+	// failure a read-only transaction may have seen a commit whose COMMIT never returned.
+	DurableVisibility bool
 	// Rebase replays a commit that lost only on shared pages (other rows of the same page) at the latest state
 	// instead of refusing it (mw_rebase=1).
 	Rebase bool
@@ -85,6 +90,9 @@ func DSN(path string, o Options) string {
 	}
 	if o.DisableReadCheck {
 		q.Set("mw_readcheck", "0")
+	}
+	if o.DurableVisibility {
+		q.Set("mw_durable_visible", "1")
 	}
 	if o.LogMaxMB > 0 {
 		q.Set("mw_log_max_mb", fmt.Sprint(o.LogMaxMB))

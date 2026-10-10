@@ -115,6 +115,7 @@ type wlog struct {
 	syncStarted uint64
 	syncDone    uint64
 	syncRunning bool
+	syncBroken  bool // an fsync failed: the data it should have covered may never reach the disk (syncMu)
 	nSyncs      atomic.Int64
 }
 
@@ -522,6 +523,11 @@ func (lg *wlog) sync() int {
 	defer lg.syncMu.Unlock()
 	need := lg.syncStarted + 1
 	for lg.syncDone < need {
+		if lg.syncBroken {
+			// a later fsync that succeeds (the kernel forgets the error) must not acknowledge a commit that sits
+			// behind a record that may be lost
+			return rcIOErrFsync
+		}
 		if lg.syncRunning {
 			lg.syncCond.Wait()
 			continue
@@ -548,6 +554,7 @@ func (lg *wlog) sync() int {
 		lg.syncRunning = false
 		lg.syncCond.Broadcast()
 		if err != nil {
+			lg.syncBroken = true
 			return rcIOErrFsync
 		}
 		lg.syncDone = mine

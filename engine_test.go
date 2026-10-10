@@ -118,8 +118,14 @@ func TestBulkOwnTables(t *testing.T) {
 
 // Lost updates: every committed increment must be in the final value.
 func TestHotCounters(t *testing.T) {
+	for _, durable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("durableVisibility=%v", durable), func(t *testing.T) { hotCounters(t, durable) })
+	}
+}
+
+func hotCounters(t *testing.T, durableVisibility bool) {
 	path := filepath.Join(t.TempDir(), "hot.db")
-	db := openT(t, path, Options{})
+	db := openT(t, path, Options{DurableVisibility: durableVisibility})
 	defer db.Close()
 	mustExec(t, db, "CREATE TABLE c(id INTEGER PRIMARY KEY, n INT)")
 	for i := 0; i < 4; i++ {

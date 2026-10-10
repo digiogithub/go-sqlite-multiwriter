@@ -39,6 +39,7 @@ func main() {
 	dir := flag.String("dir", "", "directory for the database files (default: a temporary one)")
 	variants := flag.String("variants", "sqlite,mw,mwr", "sqlite, mw (the engine), mwr (with the rebase), mwp/mwpr (multi-process mode)")
 	procs := flag.Int("procs", 1, "number of processes the writers are spread over")
+	flag.BoolVar(&durableVisible, "durable-visible", false, "engine variants: a commit becomes visible only once durable")
 	cpuprof := flag.String("cpuprofile", "", "write a CPU profile of this process to the file")
 	flag.Parse()
 	if *cpuprof != "" {
@@ -74,13 +75,16 @@ func main() {
 	}
 }
 
+var durableVisible bool
+
 func open(variant, path string, writers int) *sql.DB {
 	var db *sql.DB
 	var err error
 	if strings.HasPrefix(variant, "mw") {
 		db, err = multiwriter.Open(path, multiwriter.Options{
-			Rebase:       strings.HasSuffix(variant, "r"),
-			MultiProcess: strings.HasPrefix(variant, "mwp"),
+			Rebase:            strings.HasSuffix(variant, "r"),
+			MultiProcess:      strings.HasPrefix(variant, "mwp"),
+			DurableVisibility: durableVisible,
 		})
 	} else {
 		db, err = sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(10000)&_txlock=immediate")
