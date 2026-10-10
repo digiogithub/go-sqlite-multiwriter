@@ -111,6 +111,11 @@ type lane struct {
 	holdsReloc bool // this lane holds db.relocMu (released by publish right after its pages are installed)
 	ddlActive  bool // this lane owns the schema barrier (released when its transaction ends)
 
+	// the multi-process mode
+	mpSlot    int    // the slot of the connection in the shared registry of snapshots
+	mpHeld    bool   // the lane holds the publication lock of every process
+	mpSyncPos uint64 // where the log must be durable for the last commit of the lane
+
 	// the rebase (mw_rebase=1)
 	rebaseOn    bool
 	norebase    bool // this connection is itself a helper of the rebase: never recursive
@@ -130,7 +135,7 @@ type lane struct {
 }
 
 func newLane(db *mwDB) *lane {
-	return &lane{db: db, readcheck: true, hotCredit: defaultHotCredit, syncLevel: 2, wsIndex: map[uint32]int{}, rdCache: map[string]rdEnt{}}
+	return &lane{db: db, mpSlot: -1, readcheck: true, hotCredit: defaultHotCredit, syncLevel: 2, wsIndex: map[uint32]int{}, rdCache: map[string]rdEnt{}}
 }
 
 // MARK: - snapshots
@@ -161,11 +166,22 @@ func (l *lane) snapshotBegin() {
 	}
 	// The epoch is read while holding the registry mutex and the lane is registered before it is released: a
 	// concurrent oldestActive either sees this lane or an epoch <= the one taken here. The GC relies on it.
+	// (multi-process: the snapshot is registered in the shared registry, then this process applies what the others
+	// committed up to it)
 	db.mu.Lock()
-	l.tx.snapshotEpoch = db.visibleEpoch()
+	if db.mp != nil {
+		l.tx.snapshotEpoch = db.mp.pin(l.mpSlot)
+	} else {
+		l.tx.snapshotEpoch = db.visibleEpoch()
+	}
 	db.active[l] = struct{}{}
 	l.snapHeld = true
 	db.mu.Unlock()
+	if db.mp != nil {
+		if rc := db.mp.catchUp(l.tx.snapshotEpoch); rc != rcOK {
+			db.failed.Store(true)
+		}
+	}
 
 	l.tx.txID++
 	l.tx.commitEpoch = 0
@@ -202,6 +218,9 @@ func (l *lane) snapshotEnd() {
 	db.mu.Lock()
 	delete(db.active, l)
 	l.snapHeld = false
+	if db.mp != nil {
+		db.mp.unpin(l.mpSlot)
+	}
 	if l.holdsHot {
 		l.holdsHot = false
 		db.hotHeld.Store(0)
@@ -314,6 +333,9 @@ func (l *lane) rsMark(pgno uint32) {
 
 // mainRead serves reads page by page: the newest committed version <= the snapshot, else the real file.
 func (l *lane) mainRead(dst []byte, off int64) int {
+	if l.db.mp != nil && l.db.failed.Load() {
+		return rcIOErrRead
+	}
 	st := l.db.store
 	snap := l.snapshot()
 	pgsz := int64(st.pgsz)
@@ -534,7 +556,18 @@ func (l *lane) publish() int {
 	v := &validation{snapshotEpoch: l.tx.snapshotEpoch, checkCookie: true, cookie: cookie, readPgnos: ro,
 		ownPgnos: l.ownPg, ownEpochs: l.ownEp, ownEpoch: l.ownEpoch}
 	sync := l.syncLevel >= 2
+	// multi-process: ONE round of the publication lock per commit: the plain attempt and the relocation both run inside
+	// it, against the state they publish on (the rebase replays without it)
+	mpLocked := false
+	if db.mp != nil {
+		if rc := db.mp.lock(); rc != rcOK {
+			l.tx.state = TxAborted
+			return rc
+		}
+		mpLocked, l.mpHeld, l.mpSyncPos = true, true, 0
+	}
 	epoch, rc := db.publish(l, v, l.wsPgnos, imgs, l.wsDBSize, snapSize, sync)
+	tryRebase := false
 	if rc == errConflict && !l.noreloc {
 		// Was the conflict only that other commits extended the file? Then the transaction's new pages are
 		// renumbered above the new end and it commits.
@@ -544,25 +577,39 @@ func (l *lane) publish() int {
 			l.poisoned = true
 		} else if rr != errRelocNA {
 			rc = rr
-		} else if l.canRebase(pg1, cookie) {
-			// a physical conflict only on pages that it wrote: replay its row changes at the latest snapshot
-			e, rb := l.rebase(l.curTLS, imgs, cookie)
-			if rb == rcOK {
-				epoch, rc = e, rcOK
-				l.rbStreak = 0
-				// the pages that were published are the helper's, not the images in this lane's WAL: another commit of
-				// this snapshot would build on its own (as after a relocation)
-				l.poisoned = true
-			} else {
-				// refused: the next conflicts of this connection are probably true ones too: they are not replayed,
-				// 1, 3, 7... in a row
-				if !l.rbNoBackoff {
-					l.rbStreak = min(l.rbStreak+1, 5)
-					l.rbSkip = 1<<l.rbStreak - 1
-				}
-				if rb != errConflict {
-					rc = rb
-				}
+		} else {
+			tryRebase = true
+		}
+	}
+	if mpLocked {
+		l.mpHeld = false
+		db.mp.unlock()
+		db.mp.prepareNext()
+		if rc == rcOK && sync && l.mpSyncPos != 0 {
+			rc = db.mp.durable(l.mpSyncPos) // (the commit is visible already: an fsync that fails fails every commit from now on)
+			if rc != rcOK {
+				db.failed.Store(true)
+			}
+		}
+	}
+	if tryRebase && l.canRebase(pg1, cookie) {
+		// a physical conflict only on pages that it wrote: replay its row changes at the latest snapshot
+		e, rb := l.rebase(l.curTLS, imgs, cookie)
+		if rb == rcOK {
+			epoch, rc = e, rcOK
+			l.rbStreak = 0
+			// the pages that were published are the helper's, not the images in this lane's WAL: another commit of
+			// this snapshot would build on its own (as after a relocation)
+			l.poisoned = true
+		} else {
+			// refused: the next conflicts of this connection are probably true ones too: they are not replayed,
+			// 1, 3, 7... in a row
+			if !l.rbNoBackoff {
+				l.rbStreak = min(l.rbStreak+1, 5)
+				l.rbSkip = 1<<l.rbStreak - 1
+			}
+			if rb != errConflict {
+				rc = rb
 			}
 		}
 	}

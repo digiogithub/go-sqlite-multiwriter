@@ -45,6 +45,10 @@ type mwDB struct {
 	gateActive  atomic.Int32
 	gateOwner   atomic.Pointer[lane]
 
+	// the multi-process mode (mp.go): nil in the single-process mode
+	mp    *mpState
+	mpReq bool
+
 	hotHeld  atomic.Int32 // the hot-spot turn
 	ddlOwner atomic.Pointer[lane]
 
@@ -106,6 +110,13 @@ func releaseDB(db *mwDB) {
 	}
 	delete(registry, db.path)
 	db.stopCompactor()
+	if db.mp != nil {
+		db.releaseMP()
+		if db.realFile != nil {
+			db.realFile.Close()
+		}
+		return
+	}
 	clean := false
 	if db.store != nil && db.log != nil && !db.failed.Load() {
 		if _, err := db.compact(); err == nil {
@@ -122,7 +133,14 @@ func releaseDB(db *mwDB) {
 
 // MARK: - snapshots
 
-func (db *mwDB) visibleEpoch() uint64 { return db.epoch.Load() }
+// visibleEpoch: the newest commit a new read may see (in the multi-process mode, the newest one this process has
+// applied: a snapshot takes the committed epoch and applies up to it, see snapshotMP).
+func (db *mwDB) visibleEpoch() uint64 {
+	if db.mp != nil {
+		return db.mp.applied.Load()
+	}
+	return db.epoch.Load()
+}
 
 // oldestActive is the oldest snapshot in use (the visible epoch when none is).
 func (db *mwDB) oldestActive() uint64 {
@@ -278,7 +296,7 @@ func (db *mwDB) startCompactor() {
 			case <-db.compactorKick:
 			case <-t.C:
 			}
-			if db.log != nil && db.log.bytes() > db.logMaxBytes.Load() {
+			if (db.log != nil && db.log.bytes() > db.logMaxBytes.Load()) || (db.mp != nil && db.mp.logBytes() > db.logMaxBytes.Load()) {
 				db.compact()
 			}
 		}

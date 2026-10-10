@@ -174,14 +174,22 @@ func encodeMeta(pgsz int, base, salt uint64) []byte {
 
 // openLog opens (or creates) the log of the database at dbPath and installs the recovered commits in st. It
 // returns the epoch of the last recovered commit (the base when there is none).
-func openLog(dbPath string, pgsz int, st *store, mode os.FileMode) (*wlog, uint64, int) {
+func openLog(dbPath string, pgsz int, st *store, mode os.FileMode, shared bool) (*wlog, uint64, int) {
 	lg := &wlog{path: dbPath + "-mw", pgsz: pgsz, segBytes: defaultSegSize}
 	lg.syncCond = sync.NewCond(&lg.syncMu)
 	f, err := os.OpenFile(lg.path, os.O_RDWR|os.O_CREATE, mode)
 	if err != nil {
 		return nil, 0, rcCantOpen
 	}
-	if err := lockFile(f); err != nil {
+	// one process owns the log; in the multi-process mode every process holds it shared (so a single-process opener
+	// is refused, and the other way round)
+	locked := false
+	if shared {
+		locked = flockShared(f)
+	} else {
+		locked = lockFile(f) == nil
+	}
+	if !locked {
 		f.Close()
 		return nil, 0, rcBusy
 	}

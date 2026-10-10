@@ -58,6 +58,9 @@ type Options struct {
 	// Rebase replays a commit that lost only on shared pages (other rows of the same page) at the latest state
 	// instead of refusing it (mw_rebase=1).
 	Rebase bool
+	// MultiProcess lets several processes write the database at the same time (mw_mp=1; every process must open it
+	// so). Unix only.
+	MultiProcess bool
 	// LogMaxMB is the size of the log before it is compacted into the database file (32 MB by default).
 	LogMaxMB int
 	// MaxOpenConns limits the pool of database/sql (0: unlimited).
@@ -76,6 +79,9 @@ func DSN(path string, o Options) string {
 	q.Set("vfs", VFSName)
 	if o.Rebase {
 		q.Set("mw_rebase", "1")
+	}
+	if o.MultiProcess {
+		q.Set("mw_mp", "1")
 	}
 	if o.DisableReadCheck {
 		q.Set("mw_readcheck", "0")

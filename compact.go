@@ -23,6 +23,9 @@ type CompactResult struct {
 var errFailed = errors.New("multiwriter: the database failed (I/O error); reopen it to recover")
 
 func (db *mwDB) compact() (CompactResult, error) {
+	if db.mp != nil {
+		return db.compactMP()
+	}
 	var out CompactResult
 	st := db.store
 	if st == nil || db.log == nil {

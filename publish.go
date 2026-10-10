@@ -46,6 +46,9 @@ func (db *mwDB) readReal(pgno uint32, dst []byte) bool {
 // publish validates a transaction against v and installs it atomically at a new epoch, writes its log record and
 // makes it visible. It returns an internal conflict code, an SQLite error code or rcOK.
 func (db *mwDB) publish(l *lane, v *validation, pgnos []uint32, imgs [][]byte, wsDBSize, snapDBSize uint32, sync bool) (uint64, int) {
+	if db.mp != nil {
+		return db.publishMP(l, v, pgnos, imgs, wsDBSize, snapDBSize)
+	}
 	st := db.store
 	if db.failed.Load() {
 		return 0, rcIOErr
@@ -81,54 +84,7 @@ func (db *mwDB) publish(l *lane, v *validation, pgnos []uint32, imgs [][]byte, w
 
 	// ---- validate
 	if v != nil {
-		rc := rcOK
-		var used []uint32 // pages the transaction went through (read or wrote), sorted; built when first needed
-		for _, rp := range v.readPgnos {
-			c := st.chainGet(rp, false)
-			if c.head() <= v.snapFor(rp) {
-				continue
-			}
-			if l != nil && !l.noroute && c != nil && len(c.v) > 0 {
-				// interior page changed: is what this transaction took from it (which child to follow) unchanged?
-				if used == nil {
-					used = make([]uint32, 0, len(v.readPgnos)+n)
-					used = append(used, v.readPgnos...)
-					used = append(used, pgnos...)
-					sort.Slice(used, func(i, j int) bool { return used[i] < used[j] })
-				}
-				var old []byte
-				if oi := c.find(v.snapFor(rp)); oi >= 0 {
-					old = c.v[oi].data
-				} else {
-					buf := make([]byte, st.pgsz)
-					if db.readReal(rp, buf) {
-						old = buf
-					}
-				}
-				if old != nil && interiorRoutesSame(old, c.v[len(c.v)-1].data, st.pgsz, st.reserved, used) {
-					db.nReadsSaved.Add(1)
-					continue
-				}
-			}
-			db.nReadConflicts.Add(1)
-			rc = errConflictRead
-			break
-		}
-		if rc == rcOK {
-			for i, pg := range pgnos {
-				if chains[i].head() > v.snapFor(pg) {
-					db.nPageConflicts.Add(1)
-					rc = errConflict
-					break
-				}
-			}
-		}
-		// a schema change invalidates everything the transaction did, even on other pages
-		if rc == rcOK && v.checkCookie && st.p1Head.Load() > v.snapFor(1) && st.p1Cookie.Load() != v.cookie {
-			db.nSchemaConflicts.Add(1)
-			rc = errConflictSchema
-		}
-		if rc != rcOK {
+		if rc := db.validateLocked(l, v, pgnos, chains); rc != rcOK {
 			release()
 			return 0, rc
 		}
@@ -246,4 +202,55 @@ func (db *mwDB) publish(l *lane, v *validation, pgnos []uint32, imgs [][]byte, w
 		db.gc()
 	}
 	return epoch, rcOK
+}
+
+// validateLocked validates a commit against the newest committed versions (the stripes of every page it wrote or
+// read are held): the pages it read (an interior table page whose routes are unchanged is forgiven), the pages it
+// wrote, and the schema cookie. It returns rcOK or an internal conflict code.
+func (db *mwDB) validateLocked(l *lane, v *validation, pgnos []uint32, chains []*chain) int {
+	st := db.store
+	n := len(pgnos)
+	var used []uint32 // pages the transaction went through (read or wrote), sorted; built when first needed
+	for _, rp := range v.readPgnos {
+		c := st.chainGet(rp, false)
+		if c.head() <= v.snapFor(rp) {
+			continue
+		}
+		if l != nil && !l.noroute && c != nil && len(c.v) > 0 {
+			// an interior page changed: is what this transaction took from it (which child to follow) unchanged?
+			if used == nil {
+				used = make([]uint32, 0, len(v.readPgnos)+n)
+				used = append(used, v.readPgnos...)
+				used = append(used, pgnos...)
+				sort.Slice(used, func(i, j int) bool { return used[i] < used[j] })
+			}
+			var old []byte
+			if oi := c.find(v.snapFor(rp)); oi >= 0 {
+				old = c.v[oi].data
+			} else {
+				buf := make([]byte, st.pgsz)
+				if db.readReal(rp, buf) {
+					old = buf
+				}
+			}
+			if old != nil && interiorRoutesSame(old, c.v[len(c.v)-1].data, st.pgsz, st.reserved, used) {
+				db.nReadsSaved.Add(1)
+				continue
+			}
+		}
+		db.nReadConflicts.Add(1)
+		return errConflictRead
+	}
+	for i, pg := range pgnos {
+		if chains[i].head() > v.snapFor(pg) {
+			db.nPageConflicts.Add(1)
+			return errConflict
+		}
+	}
+	// a schema change invalidates everything the transaction did, even on other pages
+	if v.checkCookie && st.p1Head.Load() > v.snapFor(1) && st.p1Cookie.Load() != v.cookie {
+		db.nSchemaConflicts.Add(1)
+		return errConflictSchema
+	}
+	return rcOK
 }

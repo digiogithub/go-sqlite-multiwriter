@@ -1,134 +1,158 @@
 # go-sqlite-multiwriter
 
-Varios escritores concurrentes sobre **una** base de datos SQLite, en **Go puro** (sin cgo).
+Many concurrent writers on **one** SQLite database, in **pure Go** (no cgo).
 
-Es un port a Go del motor de [sqliteai/sqlite-multiwriter](https://github.com/sqliteai/sqlite-multiwriter)
-(artículo: [We solved SQLite's single-writer limitation](https://marcobambini.substack.com/p/we-solved-sqlites-single-writer-limitation)).
-Igual que el original, es un **VFS**: tu SQL, tu esquema y tu fichero `.db` no cambian, y el fichero sigue
-siendo una base SQLite normal cuando se cierra la última conexión.
+A Go port of the engine of [sqliteai/sqlite-multiwriter](https://github.com/sqliteai/sqlite-multiwriter)
+(article: [We solved SQLite's single-writer limitation](https://marcobambini.substack.com/p/we-solved-sqlites-single-writer-limitation)).
+Like the original, it is a **VFS**: your SQL, your schema and your `.db` file do not change, and the file is a
+plain SQLite database again once the last connection closes.
 
-Versión hermana en Rust: [rust-sqlite-multiwriter](https://github.com/digiogithub/rust-sqlite-multiwriter).
+Sister project in Rust: [rust-sqlite-multiwriter](https://github.com/digiogithub/rust-sqlite-multiwriter).
 
-Funciona sobre [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) (SQLite traducido a Go), así que se
-compila con `CGO_ENABLED=0` para cualquier plataforma que soporte modernc.
+It runs on [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) (SQLite translated to Go), so it builds with
+`CGO_ENABLED=0` for every platform modernc supports.
 
 ```go
 import (
     multiwriter "github.com/digiogithub/go-sqlite-multiwriter"
 )
 
-db, err := multiwriter.Open("app.db", multiwriter.Options{}) // *sql.DB, cada conexión del pool es un escritor
+db, err := multiwriter.Open("app.db", multiwriter.Options{}) // *sql.DB: every connection of the pool is a writer
 ...
 err = multiwriter.RunTx(ctx, db, nil, func(tx *sql.Tx) error {
     _, err := tx.Exec("UPDATE account SET balance = balance + 10 WHERE id = ?", 7)
     return err
-}) // reintenta la transacción entera si pierde contra otro commit (SQLITE_BUSY_SNAPSHOT)
+}) // retries the whole transaction when it loses against another commit (SQLITE_BUSY_SNAPSHOT)
 ```
 
-También se puede usar directamente con el driver de modernc: basta importar el paquete (registra el VFS) y
-abrir con la URI `file:app.db?vfs=multiwriter`.
+It can also be used directly with the modernc driver: import the package (it registers the VFS) and open the URI
+`file:app.db?vfs=multiwriter`.
 
-## Cómo funciona
+## How it works
 
 ```
-escritor 1 --> WAL privado --+
-escritor 2 --> WAL privado --+--> validación y publicación --> log de commits --> fichero .db
-escritor 3 --> WAL privado --+    (gana el primero en confirmar)                 (compactación)
+writer 1 --> private WAL --+
+writer 2 --> private WAL --+--> validation and publication --> commit log --> .db file
+writer 3 --> private WAL --+    (first committer wins)                       (compaction)
 ```
 
-* **Carriles privados.** Cada conexión tiene su propio WAL en memoria y su propio wal-index: SQLite cree que es
-  el único escritor, así que nadie espera por el lock de escritura del WAL. Las escrituras al fichero principal
-  se descartan; sólo el compactador escribe el `.db`.
-* **Snapshots.** Cada transacción lee una instantánea (época). Las páginas confirmadas se guardan en un almacén
-  de versiones `(página, época)` con locks por franjas; una lectura toma la versión más nueva ≤ su snapshot, o
-  la página del fichero.
-* **Commit.** Al llegar el frame de commit se valida: (1) el *schema cookie* no cambió; (2) ninguna página que
-  la transacción **leyó** tiene una versión nueva (evita *write skew*; una página interior de tabla cuyo
-  enrutado no cambió se perdona); (3) ninguna página que **escribió** tiene una versión nueva. Si falla, la
-  transacción se rechaza con `SQLITE_BUSY_SNAPSHOT` y la aplicación la repite.
-* **Reubicación.** Si el único conflicto es que otros commits también hicieron crecer el fichero (inserciones
-  concurrentes), las páginas nuevas se renumeran por encima del final actual, se reescriben las referencias y
-  se fusiona la página 1.
-* **Fusión de páginas interiores.** Dos transacciones que dividen hojas distintas del mismo padre se fusionan a
-  tres bandas sobre el padre.
-* **Durabilidad.** Cada commit se escribe en un log segmentado (`<db>-mw`, `<db>-mw.000001`...) con *group
-  commit* (`synchronous=FULL` por defecto: el commit está en disco cuando vuelve). El log se compacta en el
-  `.db` en segundo plano. Tras un crash, la recuperación reproduce el prefijo válido del log.
-* **Rebase** (`mw_rebase=1`, opcional). Dos escritores que cambian filas distintas pueden caer en la misma
-  página. Con el rebase, el commit que pierde no se rechaza: se decodifican sus cambios de fila directamente de
-  las páginas y se re-ejecutan con SQL normal en una conexión auxiliar sobre el estado más reciente (agrupando
-  varias peticiones en una transacción). Si la fila cambió entretanto (conflicto real) se rechaza como antes.
-* **Barrera de esquema.** Un `CREATE/DROP/ALTER/...` (detectado con `sqlite3_trace_v2`) espera a que terminen
-  los escritores en vuelo y bloquea nuevos mientras corre.
+* **Private lanes.** Every connection has its own in-memory WAL and its own wal-index: SQLite believes it is the
+  only writer, so nobody waits for the WAL write lock. Writes to the main file are discarded; only the compactor
+  writes the `.db`.
+* **Snapshots.** Every transaction reads a snapshot (an epoch). Committed pages are kept in a store of
+  `(page, epoch)` versions with striped locks; a read takes the newest version ≤ its snapshot, or the page of the
+  file.
+* **Commit.** When the commit frame arrives it is validated: (1) the schema cookie did not change; (2) no page the
+  transaction **read** has a newer version (prevents write skew; an interior table page whose routing did not
+  change is forgiven); (3) no page it **wrote** has a newer version. On failure the transaction is refused with
+  `SQLITE_BUSY_SNAPSHOT` and the application retries it.
+* **Relocation.** When the only conflict is that other commits also grew the file (concurrent inserts), the new
+  pages are renumbered above the current end, the references to them rewritten and page 1 merged.
+* **Interior page merge.** Two transactions that split different leaves of the same parent are merged three-way
+  on the parent.
+* **Durability.** Every commit goes into a segmented log (`<db>-mw`, `<db>-mw.000001`...) with group commit
+  (`synchronous=FULL` by default: the commit is on disk when it returns). The log is compacted into the `.db` in
+  the background. After a crash, recovery replays the valid prefix of the log.
+* **Rebase** (`mw_rebase=1`, optional). Two writers changing different rows can land on the same page. With the
+  rebase, the losing commit is not refused: its row changes are decoded straight from the pages and replayed with
+  ordinary SQL on a helper connection at the latest state (several requests batched into one transaction). If the
+  row itself changed meanwhile (a real conflict) it is refused as before.
+* **Schema barrier.** A `CREATE/DROP/ALTER/...` (detected with `sqlite3_trace_v2`) waits for the writers in flight
+  and holds new ones back while it runs.
+* **Multi-process** (`mw_mp=1`, optional, unix). Several processes write the same database. The shared log is the
+  source of truth: every process applies the commits of the others into its private page store before a snapshot
+  needs them. Publication is serialised across processes by an `fcntl` byte lock (released by the kernel if the
+  holder dies; the next holder finishes a complete record or takes back a torn one). A shared mapped header holds
+  the committed epoch, the log cursor and a registry of the open snapshots of every process (dead processes are
+  ignored), so compaction never overwrites a page that somebody still reads.
 
-Aislamiento: *snapshot isolation* con *first-committer-wins* por página más validación de las páginas leídas.
+Isolation: snapshot isolation with first-committer-wins per page, plus validation of the pages read.
 
-## Estado del port
+## Port status
 
-| Funcionalidad del original | Estado |
+| Feature of the original | Status |
 |---|---|
-| Carriles privados (WAL + wal-index privados por conexión) | ✅ |
-| Almacén de versiones, snapshots, validación lectura/escritura/esquema | ✅ |
-| Reubicación de páginas nuevas, fusión de páginas interiores, atajo de enrutado | ✅ |
-| Log durable con group commit, recuperación tras crash, compactación, GC | ✅ |
-| Barrera DDL, turno para zonas calientes, pragmas no soportados rechazados | ✅ |
-| **Rebase** (`mw_rebase=1`): decodificación de filas, catálogo, sentencias "puntuales" por bytecode, re-ejecución agrupada, compuerta de publicación | ✅ |
-| **Multiproceso** (`mw_mp=1`: índice compartido y log en memoria compartida) | ⏳ pendiente (hoy: un proceso por base; un segundo proceso recibe `SQLITE_BUSY`) |
+| Private lanes (private WAL + wal-index per connection) | ✅ |
+| Version store, snapshots, read/write/schema validation | ✅ |
+| Relocation of new pages, interior page merge, routing shortcut | ✅ |
+| Durable log with group commit, crash recovery, compaction, GC | ✅ |
+| DDL barrier, hot-spot turn, unsupported pragmas refused | ✅ |
+| **Rebase** (`mw_rebase=1`): row decoding, catalog, "point" statements by bytecode, batched replay, publication gate | ✅ |
+| **Multi-process** (`mw_mp=1`): shared log and header, cross-process publication lock, snapshot registry, crash repair | ✅ (unix) |
 
-Los ficheros `-mw*` no son compatibles en formato con los del original en C (no hace falta: sólo existen
-mientras la base está abierta; al cerrar la última conexión todo queda en el `.db`).
+The `-mw*` files are not format-compatible with those of the C original (they need not be: they only exist while
+the database is open; when the last connection closes everything is in the `.db`).
 
-## Rendimiento
+## Performance
 
-`go run ./cmd/mwbench -workload bulk|groups|hot -writers 1,4,16` — máquina de 4 núcleos, disco local,
-`synchronous=FULL`, todo con modernc. `sqlite` = SQLite de serie en WAL con `BEGIN IMMEDIATE` y `busy_timeout`;
-`mw` = el motor; `mwr` = el motor con rebase. "reint." = reintentos de la aplicación por cada 100 transacciones.
+`go run ./cmd/mwbench -workload bulk|groups|hot -writers 1,4,16` — 4-core machine, local disk,
+`synchronous=FULL`, everything on modernc. `sqlite` = stock SQLite in WAL mode with `BEGIN IMMEDIATE` and
+`busy_timeout`; `mw` = the engine; `mwr` = the engine with rebase. "retries" = application retries per 100
+transactions.
 
-| carga | escritores | SQLite tx/s | mw tx/s | mwr tx/s | SQLite p99.9 | mwr p99.9 |
+| workload | writers | SQLite tx/s | mw tx/s | mwr tx/s | SQLite p99.9 | mwr p99.9 |
 |---|---:|---:|---:|---:|---:|---:|
-| **bulk** (100 inserts/tx, tabla propia) | 4 | 1.163 | **1.824** | 1.719 | 1.133 ms | 23 ms |
-| | 16 | 1.129 | **1.747** | 1.722 | 4.040 ms | 42 ms |
-| **groups** (cada uno su fila, misma página) | 4 | 4.282 | 4.131 (380 reint.) | **4.877** (0 reint.) | 3 ms | 5 ms |
-| | 16 | 4.278 | 3.686 (354 reint.) | **9.506** (0 reint.) | 1.131 ms | **9,5 ms** |
-| **hot** (4 filas compartidas: conflicto real) | 16 | **4.542** | 3.755 | 3.260 | 1.131 ms | 126 ms |
+| **bulk** (100 inserts/tx, own table) | 4 | 1,163 | **1,824** | 1,719 | 1,133 ms | 23 ms |
+| | 16 | 1,129 | **1,747** | 1,722 | 4,040 ms | 42 ms |
+| **groups** (each its own row, same page) | 4 | 4,282 | 4,131 (380 retries) | **4,877** (0 retries) | 3 ms | 5 ms |
+| | 16 | 4,278 | 3,686 (354 retries) | **9,506** (0 retries) | 1,131 ms | **9.5 ms** |
+| **hot** (4 shared rows: real conflict) | 16 | **4,542** | 3,755 | 3,260 | 1,131 ms | 126 ms |
 
-* Con varios escritores el throughput sube 1,5–2,2× y, sobre todo, la latencia de cola cae de segundos a
-  milisegundos (SQLite serializa a los escritores tras un único lock).
-* Con un solo escritor el coste es similar a SQLite (±15 %).
-* Cuando varios escritores cambian **la misma fila** no hay nada que fusionar: se serializan y reintentan.
+* With several writers throughput rises 1.5–2.2× and, above all, tail latency drops from seconds to
+  milliseconds (SQLite serialises the writers behind a single lock).
+* With a single writer the cost is close to SQLite (±15 %).
+* When several writers change **the same row** there is nothing to merge: they serialise and retry.
 
-## Opciones (URI)
+## Multi-process
 
-| Parámetro | Significado |
+```go
+db, err := multiwriter.Open("app.db", multiwriter.Options{MultiProcess: true})
+```
+
+Every process must open the database in multi-process mode (`mw_mp=1`); a process that opens it the other way
+while it is open is refused. The first process to open recovers the log; the last one to close
+compacts everything into the `.db` and removes the shared files (`<db>-mw*`, `<db>-mwlock`). A process killed at
+any point (even in the middle of a commit) leaves nothing to repair by hand: the others carry on, and acknowledged
+commits are never lost.
+
+Each process keeps its own copy of the recent page versions, applied from the log on demand, so memory and the
+cost of catching up grow with the write rate of the other processes. Up to 2048 snapshots can be open at once
+over all processes.
+
+## Options (URI)
+
+| Parameter | Meaning |
 |---|---|
-| `vfs=multiwriter` | activa el motor (`mw=0` lo desactiva para esa base) |
-| `mw_rebase=1` | re-ejecuta un commit que sólo perdió por compartir página (`Options.Rebase`) |
-| `mw_rebase_backoff=0` | re-ejecuta todos los conflictos (por defecto, tras un rechazo se saltan 1, 3, 7… para no gastar en filas calientes) |
-| `mw_readcheck=0` | no validar las páginas leídas: menos reintentos, pero permite *write skew* |
-| `mw_log_max_mb` | tamaño del log antes de compactar (32 MB) |
-| `mw_base_cache_mb` | caché de páginas del fichero en memoria (64 MB) |
-| `mw_gc` | commits entre dos recolecciones de versiones (64) |
-| `mw_noreloc`, `mw_nomerge`, `mw_noroute` | desactivan reubicación / fusión / atajo de enrutado (medición) |
+| `vfs=multiwriter` | enables the engine (`mw=0` disables it for that database) |
+| `mw_rebase=1` | replays a commit that lost only because it shared a page (`Options.Rebase`) |
+| `mw_rebase_backoff=0` | replays every conflict (by default, after a refusal 1, 3, 7… are skipped so as not to waste work on hot rows) |
+| `mw_mp=1` | multi-process mode (`Options.MultiProcess`) |
+| `mw_readcheck=0` | do not validate the pages read: fewer retries, but allows write skew |
+| `mw_log_max_mb` | log size before compaction (32 MB) |
+| `mw_base_cache_mb` | in-memory cache of the pages of the file (64 MB) |
+| `mw_gc` | commits between two version collections (64) |
+| `mw_noreloc`, `mw_nomerge`, `mw_noroute` | disable relocation / merge / routing shortcut (for measurement) |
 
-## Límites
+## Limits
 
-* Sólo WAL; no `locking_mode=EXCLUSIVE` ni `auto_vacuum`. No sobre sistemas de ficheros de red.
-* Mientras está abierta, la base sólo debe usarse a través del motor (el log `-mw*` tiene commits que aún no
-  están en el `.db`).
-* Una transacción que falla con `SQLITE_BUSY_SNAPSHOT` debe repetirse **entera** (`RunTx` lo hace).
-* Un lector que nunca termina impide compactar (igual que en el original).
-* El rebase sólo se aplica a transacciones "a ciegas": `INSERT ... VALUES` y `UPDATE`/`DELETE` de una fila por
-  su clave, sin `SELECT` previo (un `SELECT` seguido de `UPDATE` se reintenta: evita *write skew*). No se aplica con
-  DDL, triggers, tablas virtuales, `AUTOINCREMENT`, claves foráneas circulares, codificación no UTF-8, ni si la
-  aplicación instala su propio `sqlite3_trace_v2`. Dos `INSERT` sin clave explícita en la misma tabla eligen el
-  mismo `rowid` y cuentan como conflicto real. `MW_DEBUG=1` muestra por qué se rechaza algo.
+* WAL only; no `locking_mode=EXCLUSIVE` nor `auto_vacuum`. Not on network file systems.
+* While it is open, the database must only be used through the engine (the `-mw*` log holds commits that are not
+  in the `.db` yet).
+* A transaction that fails with `SQLITE_BUSY_SNAPSHOT` must be retried **whole** (`RunTx` does it).
+* A reader that never ends prevents compaction (as in the original).
+* The rebase only applies to "blind" transactions: `INSERT ... VALUES` and `UPDATE`/`DELETE` of one row by its
+  key, with no prior `SELECT` (a `SELECT` followed by an `UPDATE` is retried: it prevents write skew). It does not
+  apply with DDL, triggers, virtual tables, `AUTOINCREMENT`, circular foreign keys, non-UTF-8 encodings, or when
+  the application installs its own `sqlite3_trace_v2`. Two `INSERT`s without an explicit key into the same table
+  pick the same `rowid` and count as a real conflict. `MW_DEBUG=1` shows why something is refused.
+* Multi-process mode is unix only (Linux, macOS, BSD).
 
 ## Tests
 
 ```
-go test ./...            # concurrencia, invariantes, write skew, DDL, crash y recuperación
+go test ./...            # concurrency, invariants, write skew, DDL, crash and recovery, multi-process (kills included)
 go test -race ./...
 go run ./cmd/mwbench -workload bulk|groups|hot -writers 1,4,16
 ```
 
-Licencia Apache 2.0 (ver `LICENSE` y `NOTICE`).
+Apache 2.0 license (see `LICENSE` and `NOTICE`).

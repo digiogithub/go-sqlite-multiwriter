@@ -304,3 +304,33 @@ func (s *store) unlockStripes(ss *stripeSet) {
 		}
 	}
 }
+
+// dropAtOrBelow removes every version <= base (a process of the multi-process mode that lagged behind a compaction
+// of another one: the file holds a newer state of every page than these versions).
+func (s *store) dropAtOrBelow(base uint64) {
+	dir := *s.dir.Load()
+	for b, blk := range dir {
+		if blk == nil {
+			continue
+		}
+		for i := range blk {
+			pgno := uint32(b<<chainBlockBits | i)
+			mu := s.stripeOf(pgno)
+			mu.Lock()
+			c := &blk[i]
+			k := 0
+			for k < len(c.v) && c.v[k].epoch <= base {
+				if c.v[k].epoch == 0 {
+					s.baseBytes.Add(-int64(s.pgsz))
+				}
+				s.versions.Add(-1)
+				s.bytes.Add(-int64(s.pgsz))
+				k++
+			}
+			if k > 0 {
+				c.v = append(c.v[:0], c.v[k:]...)
+			}
+			mu.Unlock()
+		}
+	}
+}

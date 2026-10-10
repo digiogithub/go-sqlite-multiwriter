@@ -300,7 +300,7 @@ func vfsOpen(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32, pOut uintpt
 	l.norebase = uriBool(tls, zName, "mw_norebase", false)
 	l.rebaseOn = uriBool(tls, zName, "mw_rebase", false) && !l.norebase
 	l.rbNoBackoff = !uriBool(tls, zName, "mw_rebase_backoff", true)
-	if rc := openMain(tls, real, db, path); rc != rcOK {
+	if rc := openMain(tls, real, db, path, uriBool(tls, zName, "mw_mp", false)); rc != rcOK {
 		realClose(tls, real)
 		releaseDB(db)
 		return rc
@@ -313,6 +313,13 @@ func vfsOpen(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32, pOut uintpt
 	}
 	if _, ok := uriParam(tls, zName, "mw_base_cache_mb"); ok {
 		db.store.baseLimit = uriInt(tls, zName, "mw_base_cache_mb", 64) << 20
+	}
+	if db.mp != nil {
+		if l.mpSlot = db.mp.allocSlot(); l.mpSlot < 0 {
+			realClose(tls, real)
+			releaseDB(db)
+			return rcFull // the shared registry of snapshots is full
+		}
 	}
 	newHandle(pFile, &mwFile{lane: l, real: real}, &laneIO)
 	noteLane(tls, l)
@@ -431,7 +438,7 @@ func traceCallback(tls *libc.TLS, typ uint32, ctx, p, x uintptr) int32 {
 
 // openMain: the first lane of a database creates the page store from the real file's header and opens (or recovers)
 // the log.
-func openMain(tls *libc.TLS, real uintptr, db *mwDB, path string) int32 {
+func openMain(tls *libc.TLS, real uintptr, db *mwDB, path string, mp bool) int32 {
 	h := libc.Xmalloc(tls, 100)
 	defer libc.Xfree(tls, h)
 	if rc := realRead(tls, real, h, 100, 0); rc != rcOK {
@@ -455,6 +462,9 @@ func openMain(tls *libc.TLS, real uintptr, db *mwDB, path string) int32 {
 		if db.store.pgsz != pgsz {
 			return rcMisuse
 		}
+		if db.mpReq != mp {
+			return rcCantOpen // one database, one mode (the processes mode is a property of the database)
+		}
 		return rcOK
 	}
 	fi, err := os.Stat(path)
@@ -465,10 +475,21 @@ func openMain(tls *libc.TLS, real uintptr, db *mwDB, path string) int32 {
 	if err != nil {
 		return rcCantOpen
 	}
+	mode := fi.Mode().Perm() &^ 0o111
+	if mp {
+		db.realFile = rf
+		if rc := db.openMP(path, pgsz, reserved, mode, rf, fi.Size()); rc != rcOK {
+			db.realFile = nil
+			rf.Close()
+			return int32(rc)
+		}
+		db.mpReq = true
+		db.startCompactor()
+		return rcOK
+	}
 	st := newStore(pgsz, uint32(fi.Size()/int64(pgsz)))
 	st.reserved = reserved
-	mode := fi.Mode().Perm() &^ 0o111
-	lg, last, rc := openLog(path, pgsz, st, mode)
+	lg, last, rc := openLog(path, pgsz, st, mode, false)
 	if rc != rcOK {
 		rf.Close()
 		return int32(rc)
@@ -584,6 +605,9 @@ func lmClose(tls *libc.TLS, p uintptr) int32 {
 		l.ddlEnd()
 	}
 	l.rebaseFree()
+	if l.db.mp != nil {
+		l.db.mp.freeSlot(l.mpSlot)
+	}
 	if db := l.cdb.Load(); db != 0 {
 		dbLanes.CompareAndDelete(db, l)
 	}

@@ -740,6 +740,9 @@ func (l *lane) helperOpen() bool {
 		return true
 	}
 	u := "file:" + (&url.URL{Path: l.db.path}).EscapedPath() + "?mw=1&mw_norebase=1"
+	if l.db.mp != nil {
+		u += "&mw_mp=1"
+	}
 	h, rc := copen(u, sqlite3.SQLITE_OPEN_READWRITE|sqlite3.SQLITE_OPEN_URI|sqlite3.SQLITE_OPEN_NOMUTEX|sqlite3.SQLITE_OPEN_PRIVATECACHE, VFSName)
 	if rc != rcOK {
 		return false
