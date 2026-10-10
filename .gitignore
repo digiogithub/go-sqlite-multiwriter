@@ -1,0 +1,3 @@
+mwbench-*/
+*.test
+*.prof

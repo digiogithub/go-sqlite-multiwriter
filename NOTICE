@@ -1,0 +1,8 @@
+go-sqlite-multiwriter
+Copyright 2026 Digio
+
+This product is a Go port of sqlite-multiwriter (https://github.com/sqliteai/sqlite-multiwriter),
+Copyright 2026 SQLite Cloud, Inc., licensed under the Apache License 2.0. The design, the commit
+protocol, the page relocation, the interior-page merge and the routing check follow that project.
+
+It uses modernc.org/sqlite (BSD-3-Clause), which includes SQLite (public domain).
