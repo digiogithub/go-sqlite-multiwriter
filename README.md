@@ -7,6 +7,8 @@ Es un port a Go del motor de [sqliteai/sqlite-multiwriter](https://github.com/sq
 Igual que el original, es un **VFS**: tu SQL, tu esquema y tu fichero `.db` no cambian, y el fichero sigue
 siendo una base SQLite normal cuando se cierra la última conexión.
 
+Versión hermana en Rust: [rust-sqlite-multiwriter](https://github.com/digiogithub/rust-sqlite-multiwriter).
+
 Funciona sobre [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) (SQLite traducido a Go), así que se
 compila con `CGO_ENABLED=0` para cualquier plataforma que soporte modernc.
 
@@ -71,7 +73,7 @@ Aislamiento: *snapshot isolation* con *first-committer-wins* por página más va
 | Log durable con group commit, recuperación tras crash, compactación, GC | ✅ |
 | Barrera DDL, turno para zonas calientes, pragmas no soportados rechazados | ✅ |
 | **Rebase** (`mw_rebase=1`): decodificación de filas, catálogo, sentencias "puntuales" por bytecode, re-ejecución agrupada, compuerta de publicación | ✅ |
-| **Multiproceso** (`mw_mp=1`: índice compartido y log en memoria compartida) | ⏳ fase 3 (hoy: un proceso por base; un segundo proceso recibe `SQLITE_BUSY`) |
+| **Multiproceso** (`mw_mp=1`: índice compartido y log en memoria compartida) | ⏳ pendiente (hoy: un proceso por base; un segundo proceso recibe `SQLITE_BUSY`) |
 
 Los ficheros `-mw*` no son compatibles en formato con los del original en C (no hace falta: sólo existen
 mientras la base está abierta; al cerrar la última conexión todo queda en el `.db`).

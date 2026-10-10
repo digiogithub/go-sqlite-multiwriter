@@ -183,10 +183,18 @@ type Stats struct {
 }
 
 func dbFor(path string) *mwDB {
+	path = strings.TrimPrefix(path, "file:")
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
-	return lookupDB(strings.TrimPrefix(path, "file:"))
+	if db := lookupDB(path); db != nil {
+		return db
+	}
+	// SQLite names the database by its full path with the symbolic links resolved
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return lookupDB(real)
+	}
+	return nil
 }
 
 // GetStats returns the statistics of a database open with the engine in this process.
