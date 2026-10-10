@@ -789,6 +789,16 @@ func (db *mwDB) compactMP() (CompactResult, error) {
 	}
 	defer byteUnlock(m.lockF, lockCompact)
 
+	// no collection until the pages and the size of T are copied: it could drop the versions of T (a collection
+	// only keeps the newest version at or below the oldest snapshot, which may move past T meanwhile)
+	db.gcMu.Lock()
+	gcHeld := true
+	defer func() {
+		if gcHeld {
+			db.gcMu.Unlock()
+		}
+	}()
+
 	// the target is chosen under the publication lock: announce it, then scan the registry
 	if rc := m.lock(); rc != rcOK {
 		return out, sqliteErr(rc)
@@ -832,6 +842,8 @@ func (db *mwDB) compactMP() (CompactResult, error) {
 		}
 	}
 	sizePages := st.dbsize(T)
+	db.gcMu.Unlock()
+	gcHeld = false
 	if werr == nil && sizePages > 0 {
 		werr = db.realFile.Truncate(int64(sizePages) * int64(pgsz))
 	}

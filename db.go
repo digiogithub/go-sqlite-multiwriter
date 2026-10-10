@@ -61,6 +61,7 @@ type mwDB struct {
 	logMaxBytes   atomic.Int64
 	gcInterval    atomic.Int64
 	pubSinceGC    atomic.Int64
+	gcMu          sync.Mutex // one collection at a time; held by a multi-process compaction while it copies pages
 
 	// statistics
 	nCommits, nAborts, nSnapshots, nPageConflicts, nReadConflicts, nSchemaConflicts atomic.Int64
@@ -208,7 +209,13 @@ func (db *mwDB) gc() int64 {
 		return 0
 	}
 	db.pubSinceGC.Store(0)
+	db.gcMu.Lock()
+	defer db.gcMu.Unlock()
 	oldest := db.oldestActive()
+	if db.mp != nil {
+		// the versions a compaction may still copy into the file are those of the oldest snapshot of any process
+		oldest = min(oldest, db.mp.oldest())
+	}
 	st.seqMu.Lock()
 	compacted := st.compactedEpoch
 	st.seqMu.Unlock()

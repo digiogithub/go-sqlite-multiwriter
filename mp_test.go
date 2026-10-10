@@ -75,6 +75,39 @@ func mpChild(role string) int {
 			}
 			ack.WriteString("1\n")
 		}
+	case "bulk":
+		// n writers, each inserting 100 rows per transaction into its own table (the file grows from every process)
+		var wg sync.WaitGroup
+		failed := make(chan error, n)
+		deadline := time.Now().Add(2 * time.Second)
+		for k := 0; k < n; k++ {
+			wg.Add(1)
+			go func(tab int) {
+				defer wg.Done()
+				for i := 0; time.Now().Before(deadline); i++ {
+					err := RunTx(ctx, db, nil, func(tx *sql.Tx) error {
+						for r := 0; r < 100; r++ {
+							if _, err := tx.Exec(fmt.Sprintf("INSERT INTO t%d(v) VALUES(?)", tab), strings.Repeat("y", 30)); err != nil {
+								return err
+							}
+						}
+						return nil
+					})
+					if err != nil {
+						failed <- fmt.Errorf("table %d, transaction %d: %w", tab, i, err)
+						return
+					}
+				}
+			}(id*n + k)
+		}
+		wg.Wait()
+		close(failed)
+		rc := 0
+		for err := range failed {
+			fmt.Fprintln(os.Stderr, "child", id, err)
+			rc = 3
+		}
+		return rc
 	case "hold":
 		// keeps the database open (and a snapshot) until killed
 		tx, _ := db.Begin()
@@ -312,5 +345,46 @@ func TestMPModeMismatch(t *testing.T) {
 	defer single.Close()
 	if _, err := single.Exec("SELECT 1 FROM c"); err == nil {
 		t.Fatal("a single-process opener was accepted while the database is open in the processes mode")
+	}
+}
+
+// Every process grows the file at the same time (relocation of the new pages across processes).
+func TestMPBulkGrowth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bulk.db")
+	const P, W = 4, 4
+	db := mpSetup(t, path, P*W)
+	var cmds []*exec.Cmd
+	for p := 0; p < P; p++ {
+		cmds = append(cmds, spawn(t, "bulk", path, p, W))
+	}
+	for i, c := range cmds {
+		if err := c.Wait(); err != nil {
+			t.Errorf("child %d: %v", i, err)
+		}
+	}
+	var res string
+	if err := db.QueryRow("PRAGMA integrity_check").Scan(&res); err != nil || res != "ok" {
+		if len(res) > 300 {
+			res = res[:300]
+		}
+		t.Errorf("integrity_check: %q %v", res, err)
+		db.Close()
+		db = openT(t, path, Options{})
+		db.QueryRow("PRAGMA integrity_check").Scan(&res)
+		if len(res) > 300 {
+			res = res[:300]
+		}
+		db.Close()
+		if d := os.Getenv("MW_KEEP"); d != "" {
+			b, _ := os.ReadFile(path)
+			os.WriteFile(d, b, 0o644)
+		}
+		t.Fatalf("after reopening: %q", res)
+	}
+	for w := 0; w < P*W; w++ {
+		var n int
+		if err := db.QueryRow(fmt.Sprintf("SELECT count(*) FROM t%d", w)).Scan(&n); err != nil || n%100 != 0 {
+			t.Fatalf("t%d: %d rows, %v", w, n, err)
+		}
 	}
 }
