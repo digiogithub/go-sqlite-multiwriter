@@ -87,6 +87,8 @@ type mpState struct {
 
 	filesMu sync.Mutex
 	bg      sync.WaitGroup // background segment preparation, waited for by close
+	prep    atomic.Bool    // a preparation runs in this process (the fcntl lock only excludes the other processes)
+	prepped atomic.Uint32  // the next segment is known to be ready up to this id
 	files   map[uint32]*os.File
 	syncMu  sync.Mutex
 
@@ -137,6 +139,16 @@ func (db *mwDB) openMP(path string, pgsz, reserved int, mode os.FileMode, rf *os
 		m.salt, m.meta = lg.salt, lg.meta
 		base := lg.baseEpoch()
 		cur := lg.cur()
+		// the current segment is written whole before anybody appends to it (an append inside the file needs no
+		// change of its size to be durable: the fdatasync of a commit is cheaper)
+		if fi, err := cur.f.Stat(); err == nil && fi.Size() < mpSegBytes {
+			for off := max(cur.end, fi.Size()); off < mpSegBytes; off += int64(len(zeroChunk)) {
+				if _, err := cur.f.WriteAt(zeroChunk[:min(int64(len(zeroChunk)), mpSegBytes-off)], off); err != nil {
+					break
+				}
+			}
+			fsyncFile(cur.f)
+		}
 		for _, s := range lg.segs {
 			m.files[s.id] = s.f
 			m.segMax[s.id] = s.maxEpoch
@@ -398,22 +410,29 @@ func (m *mpState) roll(id uint32) error {
 // lock: a record then overwrites blocks that exist, and its fsync does not have to commit a new size of the file.
 func (m *mpState) prepareNext() {
 	cur := uint32(m.u(oCurSeg).Load())
-	if m.u(oCurEnd).Load() < mpSegBytes/2 {
+	if m.prepped.Load() > cur {
 		return
 	}
 	p := segPath(m.path, cur+1) + ".prep"
 	if _, err := os.Stat(p); err == nil {
+		m.prepped.Store(cur + 1)
 		return
 	}
 	if _, err := os.Stat(segPath(m.path, cur+1)); err == nil {
+		m.prepped.Store(cur + 1)
+		return
+	}
+	if !m.prep.CompareAndSwap(false, true) {
 		return
 	}
 	if !byteLock(m.lockF, lockPrefill, false) {
+		m.prep.Store(false)
 		return
 	}
 	m.bg.Add(1)
 	go func() {
 		defer m.bg.Done()
+		defer m.prep.Store(false)
 		defer byteUnlock(m.lockF, lockPrefill)
 		tmp := p + ".tmp"
 		f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -429,6 +448,8 @@ func (m *mpState) prepareNext() {
 		f.Close()
 		if !ok || os.Rename(tmp, p) != nil {
 			os.Remove(tmp)
+		} else {
+			m.prepped.Store(cur + 1)
 		}
 	}()
 }

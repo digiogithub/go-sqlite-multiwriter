@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,7 +39,16 @@ func main() {
 	dir := flag.String("dir", "", "directory for the database files (default: a temporary one)")
 	variants := flag.String("variants", "sqlite,mw,mwr", "sqlite, mw (the engine), mwr (with the rebase), mwp/mwpr (multi-process mode)")
 	procs := flag.Int("procs", 1, "number of processes the writers are spread over")
+	cpuprof := flag.String("cpuprofile", "", "write a CPU profile of this process to the file")
 	flag.Parse()
+	if *cpuprof != "" {
+		f, err := os.Create(*cpuprof)
+		if err != nil {
+			panic(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 	if os.Getenv("MWBENCH_CHILD") != "" {
 		child()
 		return
