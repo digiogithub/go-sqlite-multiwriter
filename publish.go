@@ -185,6 +185,9 @@ func (db *mwDB) publish(l *lane, v *validation, pgnos []uint32, imgs [][]byte, w
 	if rc := db.makeVisible(epoch); rc != rcOK {
 		return 0, rc
 	}
+	if l != nil {
+		l.releaseHot()
+	}
 	if sync && !durableFirst {
 		if rc := db.log.sync(); rc != rcOK {
 			db.failed.Store(true) // visible already, outcome uncertain: stop accepting commits

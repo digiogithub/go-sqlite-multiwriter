@@ -734,6 +734,9 @@ func (db *mwDB) publishMP(l *lane, v *validation, pgnos []uint32, imgs [][]byte,
 	db.nextEpoch.Store(epoch)
 	db.epoch.Store(epoch)
 	if l != nil {
+		l.releaseHot()
+	}
+	if l != nil {
 		l.mpSyncPos = logPos(seg, off+size)
 	}
 	db.nCommits.Add(1)

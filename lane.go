@@ -221,10 +221,7 @@ func (l *lane) snapshotEnd() {
 	if db.mp != nil {
 		db.mp.unpin(l.mpSlot)
 	}
-	if l.holdsHot {
-		l.holdsHot = false
-		db.hotHeld.Store(0)
-	}
+	l.releaseHot()
 	if !l.tx.isWriter && l.retryCredit > 0 {
 		l.retryCredit--
 	}
@@ -686,6 +683,15 @@ func (l *lane) ddlBegin() {
 func (l *lane) ddlEnd() {
 	l.ddlActive = false
 	l.db.ddlOwner.CompareAndSwap(l, nil)
+}
+
+// releaseHot gives the hot-spot turn back: when the lane's commit is visible (the next holder's snapshot sees it, no
+// need to wait for its fsync), or at the end of the transaction.
+func (l *lane) releaseHot() {
+	if l.holdsHot {
+		l.holdsHot = false
+		l.db.hotHeld.Store(0)
+	}
 }
 
 // yield lets the other goroutines run (used by spin waits).
