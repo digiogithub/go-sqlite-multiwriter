@@ -38,6 +38,7 @@ func (db *mwDB) compact() (CompactResult, error) {
 	defer db.compactMu.Unlock()
 
 	T := db.oldestActive()
+	mark := db.log.appended.Load() // (every record <= T was placed before T became visible)
 	base := db.log.baseEpoch()
 	if T <= base {
 		return out, nil // nothing new to materialise (or pinned by an old reader)
@@ -95,6 +96,8 @@ func (db *mwDB) compact() (CompactResult, error) {
 	if werr == nil {
 		if rc := db.log.setBase(T); rc != rcOK {
 			werr = sqliteErr(rc)
+		} else {
+			db.log.markCompacted(mark)
 		}
 	}
 	// 3. settle the dirty list: clean pages drop out, pages with newer versions (or everything, on failure) stay

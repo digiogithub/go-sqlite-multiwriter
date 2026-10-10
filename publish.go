@@ -198,7 +198,7 @@ func (db *mwDB) publish(l *lane, v *validation, pgnos []uint32, imgs [][]byte, w
 
 	// the log only shrinks through compaction: ask the compactor, and throttle if it cannot keep up
 	if lim := db.logMaxBytes.Load(); lim > 0 {
-		if b := db.log.bytes(); b > lim {
+		if b := db.log.pending(); b > lim {
 			db.kickCompactor()
 			if b > lim*16 {
 				db.nBackpressure.Add(1)

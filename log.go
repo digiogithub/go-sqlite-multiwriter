@@ -109,6 +109,10 @@ type wlog struct {
 	segBytes int64
 	roll     bool // the next record starts a new segment (seqMu)
 	total    atomic.Int64
+	// bytes of records ever placed (monotonic) and the value of it the last compaction covered: the difference is
+	// what waits for a compaction (the size of the files is not: a segment is only deleted whole)
+	appended      atomic.Int64
+	compactedMark atomic.Int64
 
 	syncMu      sync.Mutex
 	syncCond    *sync.Cond
@@ -386,6 +390,7 @@ func (lg *wlog) replay(ids []uint32, base uint64, st *store) (uint64, int) {
 		seg.ready.Store(off)
 		lg.segs = append(lg.segs, seg)
 		lg.total.Add(off)
+		lg.appended.Add(off) // (a recovered log waits for a compaction)
 	}
 	return last, rcOK
 }
@@ -480,6 +485,7 @@ func (lg *wlog) assign(epoch uint64, n int) (*segment, int64, int) {
 		seg.maxEpoch = epoch
 	}
 	lg.total.Add(size)
+	lg.appended.Add(size)
 	return seg, off, rcOK
 }
 
@@ -491,6 +497,7 @@ func (lg *wlog) unassign(seg *segment, off int64, n int) bool {
 	}
 	seg.end = off
 	lg.total.Add(-size)
+	lg.appended.Add(-size)
 	return true
 }
 
@@ -565,6 +572,19 @@ func (lg *wlog) sync() int {
 
 func (lg *wlog) baseEpoch() uint64 { return lg.base.Load() }
 func (lg *wlog) bytes() int64      { return lg.total.Load() }
+
+// pending is the number of bytes placed since what the last compaction covered (the compaction trigger).
+func (lg *wlog) pending() int64 { return lg.appended.Load() - lg.compactedMark.Load() }
+
+// markCompacted: a compaction covered everything placed up to mark.
+func (lg *wlog) markCompacted(mark int64) {
+	for {
+		cur := lg.compactedMark.Load()
+		if mark <= cur || lg.compactedMark.CompareAndSwap(cur, mark) {
+			return
+		}
+	}
+}
 
 // setBase durably records that the state up to base is in the database file.
 func (lg *wlog) setBase(base uint64) int {

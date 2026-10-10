@@ -304,7 +304,7 @@ func (db *mwDB) startCompactor() {
 			case <-db.compactorKick:
 			case <-t.C:
 			}
-			if (db.log != nil && db.log.bytes() > db.logMaxBytes.Load()) || (db.mp != nil && db.mp.logBytes() > db.logMaxBytes.Load()) {
+			if (db.log != nil && db.log.pending() > db.logMaxBytes.Load()) || (db.mp != nil && db.mp.logBytes() > db.logMaxBytes.Load()) {
 				db.compact()
 			}
 		}

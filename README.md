@@ -103,19 +103,19 @@ transactions.
 
 | workload | writers | SQLite tx/s | mw tx/s | mwr tx/s | SQLite p99.9 | mw p99.9 | mwr p99.9 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **bulk** (100 inserts/tx, own table) | 1 | **1,213** | 1,128 | 1,056 | 6 ms | 4 ms | 5 ms |
-| | 4 | 1,123 | **1,952** | 1,929 | 37 ms | 12 ms | 16 ms |
-| | 16 | 1,152 | **1,731** | 1,697 | 5,038 ms | 29 ms | 35 ms |
-| **groups** (each its own row, same page) | 1 | **4,684** | 3,824 | 3,954 | 2 ms | 3 ms | 3 ms |
-| | 4 | 4,938 | **7,397** (32 retries) | 5,581 (0 retries) | 2.2 ms | 4.9 ms | 6 ms |
-| | 16 | 4,061 | **14,792** (122 retries) | 10,195 (0 retries) | 931 ms | 7.7 ms | 8.5 ms |
-| **hot** (4 shared rows: real conflict) | 1 | **4,461** | 3,990 | 3,243 | 2 ms | 3.5 ms | 4.3 ms |
-| | 4 | 4,302 | **7,490** (33 retries) | 6,628 | 2.5 ms | 4.9 ms | 5.7 ms |
-| | 16 | 4,367 | **14,661** (122 retries) | 12,210 | 1,431 ms | 37 ms | 17 ms |
+| **bulk** (100 inserts/tx, own table) | 1 | **1,173** | 1,033 | 930 | 6 ms | 5 ms | 7 ms |
+| | 4 | 1,106 | 1,761 | **1,825** | 632 ms | 17 ms | 17 ms |
+| | 16 | 1,107 | **1,815** | 1,779 | 2,837 ms | 47 ms | 40 ms |
+| **groups** (each its own row, same page) | 1 | **4,733** | 4,268 | 3,382 | 1.7 ms | 4 ms | 4 ms |
+| | 4 | 4,531 | **8,364** (35 retries) | 6,755 (0 retries) | 2.5 ms | 4.8 ms | 5.8 ms |
+| | 16 | 4,253 | **14,138** (128 retries) | 10,849 (0 retries) | 1,233 ms | 24 ms | 9.8 ms |
+| **hot** (4 shared rows: real conflict) | 1 | **4,711** | 4,484 | 4,350 | 1.8 ms | 3.2 ms | 3.5 ms |
+| | 4 | 4,209 | **8,157** (35 retries) | 6,783 | 3.8 ms | 4.8 ms | 6.7 ms |
+| | 16 | 3,966 | **13,952** (124 retries) | 11,523 | 1,133 ms | 10 ms | 11 ms |
 
-* With several writers throughput rises 1.5–3.6× and, above all, tail latency drops from seconds to
+* With several writers throughput rises 1.6–3.5× and, above all, tail latency drops from seconds to
   milliseconds (SQLite serialises the writers behind a single lock).
-* With a single writer the cost is close to SQLite (within 20 %, mostly the noise of the fsync).
+* With a single writer the cost is close to SQLite (5–12 %: the engine's own record and fsync per commit).
 * The rebase trades throughput for no retries at all: with commits visible before their fsync a retry is cheap and
   plain `mw` is faster; the rebase pays when a transaction is expensive to run again in the application.
 * With `mw_durable_visible=1` (strict order) the contended workloads fall back to about SQLite's throughput
@@ -166,7 +166,7 @@ over all processes.
 | `mw_mp=1` | multi-process mode (`Options.MultiProcess`) |
 | `mw_durable_visible=1` | a commit becomes visible only once it is on the disk, like stock SQLite (`Options.DurableVisibility`) |
 | `mw_readcheck=0` | do not validate the pages read: fewer retries, but allows write skew |
-| `mw_log_max_mb` | log size before compaction (32 MB) |
+| `mw_log_max_mb` | log written since the last compaction that triggers the next one (32 MB) |
 | `mw_base_cache_mb` | in-memory cache of the pages of the file (64 MB) |
 | `mw_gc` | commits between two version collections (64) |
 | `mw_noreloc`, `mw_nomerge`, `mw_noroute` | disable relocation / merge / routing shortcut (for measurement) |

@@ -57,8 +57,9 @@ const (
 	oBaseSize  = 96 // database size in pages at the base
 	oCompactT  = 104
 	oReady     = 112
-	oLogBytes  = 120 // bytes of live log (approximate: for the compaction trigger)
+	oLogBytes  = 120 // bytes of records ever placed (monotonic): the compaction trigger is it minus oMark
 	oSegMin    = 128 // the oldest segment that may exist
+	oMark      = 136 // the value of oLogBytes that the last compaction covered
 )
 
 func u64At(m *shmMap, off int) *atomic.Uint64 { return (*atomic.Uint64)(unsafe.Pointer(&m.mem[off])) }
@@ -828,6 +829,7 @@ func (db *mwDB) compactMP() (CompactResult, error) {
 		return out, sqliteErr(rc)
 	}
 	cand := m.committed()
+	mark := m.u(oLogBytes).Load() // (every record <= the target is placed)
 	m.u(oCompactT).Store(cand)
 	T := min(cand, m.oldest(), db.oldestActive())
 	base := m.u(oBase).Load()
@@ -919,20 +921,17 @@ func (db *mwDB) compactMP() (CompactResult, error) {
 	}
 	m.applyMu.Unlock()
 	sort.Slice(gone, func(i, j int) bool { return gone[i] < gone[j] })
-	var freed int64
 	for _, id := range gone {
-		if fi, err := os.Stat(segPath(m.path, id)); err == nil {
-			freed += fi.Size()
-		}
 		os.Remove(segPath(m.path, id))
 		m.forget(id)
 		m.applyMu.Lock()
 		delete(m.segMax, id)
 		m.applyMu.Unlock()
 	}
-	if freed > 0 {
-		if ids, err := listSegments(m.path); err == nil && len(ids) > 0 {
-			m.u(oLogBytes).Store(uint64(len(ids)-1)*mpSegBytes + m.u(oCurEnd).Load())
+	for {
+		cur := m.u(oMark).Load()
+		if mark <= cur || m.u(oMark).CompareAndSwap(cur, mark) {
+			break
 		}
 	}
 	out.TargetEpoch = T
@@ -942,5 +941,6 @@ func (db *mwDB) compactMP() (CompactResult, error) {
 	return out, nil
 }
 
-// logBytesMP: the live log (for the compaction trigger).
-func (m *mpState) logBytes() int64 { return int64(m.u(oLogBytes).Load()) }
+// logBytes: the bytes placed since what the last compaction covered (the compaction trigger; the size of the files
+// is not: a segment is only deleted whole).
+func (m *mpState) logBytes() int64 { return int64(m.u(oLogBytes).Load() - m.u(oMark).Load()) }
