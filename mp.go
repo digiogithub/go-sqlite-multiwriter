@@ -12,8 +12,10 @@ package multiwriter
 //
 //	"<db>-mwlock"  the shared header (mapped by every process): committed epoch, compaction base, the cursor of the
 //	               log, the commit in flight, the durable position, the registry of snapshots (one slot per
-//	               connection: pid, snapshot); its bytes 1..3 are the cross-process locks (fcntl: the kernel
-//	               releases them when a process dies)
+//	               connection: pid, snapshot); every process holds a shared flock on it (membership); on Linux its
+//	               bytes 1..3 are also the cross-process locks (fcntl: the kernel releases them when a process dies)
+//	"<db>-mwfcntl" the cross-process locks (bytes 1..3, fcntl) where flock and fcntl locks interact (macOS, the
+//	               BSDs: a process's own shared flock would block its fcntl write lock on the same file forever)
 //	"<db>-mw"      the meta header of the log (base epoch, salt), held shared by every process
 //	"<db>-mw.N"    the segments of the log, written ahead of their end with zeros
 //
@@ -28,6 +30,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -68,9 +71,16 @@ func logPos(seg uint32, end int64) uint64 { return uint64(seg)<<40 | uint64(end)
 func posSeg(p uint64) uint32              { return uint32(p >> 40) }
 func posEnd(p uint64) int64               { return int64(p & (1<<40 - 1)) }
 
+// separateByteLocks keeps the fcntl byte locks off the file that carries the membership flock. On Linux flock and
+// fcntl locks are independent and the byte locks stay on "<db>-mwlock" (as before: processes of older versions
+// sharing the database keep excluding each other); elsewhere (macOS, the BSDs) both kinds of lock live in the same
+// per-file list, so a shared flock conflicts with an fcntl write lock of any owner, the holder's own included.
+var separateByteLocks = runtime.GOOS != "linux"
+
 type mpState struct {
 	db    *mwDB
 	lockF *os.File
+	byteF *os.File // the file of the fcntl byte locks: lockF, or "<db>-mwfcntl" (separateByteLocks)
 	shm   *shmMap
 	path  string // the log ("<db>-mw")
 	pgsz  int
@@ -113,17 +123,24 @@ func (db *mwDB) openMP(path string, pgsz, reserved int, mode os.FileMode, rf *os
 	if err != nil {
 		return rcCantOpen
 	}
-	m := &mpState{db: db, lockF: lf, path: path + "-mw", pgsz: pgsz, files: map[uint32]*os.File{}, segMax: map[uint32]uint64{}, pid: uint64(os.Getpid())}
+	bf := lf
+	if separateByteLocks {
+		if bf, err = os.OpenFile(path+"-mwfcntl", os.O_RDWR|os.O_CREATE, mode); err != nil {
+			lf.Close()
+			return rcCantOpen
+		}
+	}
+	m := &mpState{db: db, lockF: lf, byteF: bf, path: path + "-mw", pgsz: pgsz, files: map[uint32]*os.File{}, segMax: map[uint32]uint64{}, pid: uint64(os.Getpid())}
 	first := flockTry(lf, true)
 	if !first {
 		if err := flockWait(lf, false); err != nil { // (waits for the first one to finish the header)
-			lf.Close()
+			m.closeLocks(false)
 			return rcBusy
 		}
 	}
 	shm, err := mapShared(lf, mpHeaderSize)
 	if err != nil {
-		lf.Close()
+		m.closeLocks(false)
 		return rcCantOpen
 	}
 	m.shm = shm
@@ -247,7 +264,6 @@ func (m *mpState) close(remove bool) {
 		for _, p := range prepPaths(m.path) {
 			os.Remove(p)
 		}
-		os.Remove(m.lockF.Name())
 	}
 	if m.meta != nil {
 		unlockFile(m.meta)
@@ -256,7 +272,22 @@ func (m *mpState) close(remove bool) {
 	if m.shm != nil {
 		m.shm.unmap()
 	}
-	m.lockF.Close() // (drops the flock and every fcntl lock of the process on it)
+	m.closeLocks(remove)
+}
+
+// closeLocks closes (and with remove deletes) the lock files: closing drops the flock and every fcntl lock of the
+// process on them.
+func (m *mpState) closeLocks(remove bool) {
+	if m.byteF != nil && m.byteF != m.lockF {
+		if remove {
+			os.Remove(m.byteF.Name())
+		}
+		m.byteF.Close()
+	}
+	if remove {
+		os.Remove(m.lockF.Name())
+	}
+	m.lockF.Close()
 }
 
 // releaseMP: the last process to leave materialises everything into the database file and removes the shared files.
@@ -428,7 +459,7 @@ func (m *mpState) prepareNext() {
 	if !m.prep.CompareAndSwap(false, true) {
 		return
 	}
-	if !byteLock(m.lockF, lockPrefill, false) {
+	if !byteLock(m.byteF, lockPrefill, false) {
 		m.prep.Store(false)
 		return
 	}
@@ -436,7 +467,7 @@ func (m *mpState) prepareNext() {
 	go func() {
 		defer m.bg.Done()
 		defer m.prep.Store(false)
-		defer byteUnlock(m.lockF, lockPrefill)
+		defer byteUnlock(m.byteF, lockPrefill)
 		tmp := p + ".tmp"
 		f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 		if err != nil {
@@ -605,7 +636,7 @@ func (m *mpState) adoptBase(base uint64) {
 // private store up to the committed state.
 func (m *mpState) lock() int {
 	m.pubMu.Lock()
-	byteLock(m.lockF, lockPublish, true)
+	byteLock(m.byteF, lockPublish, true)
 	m.applyMu.Lock()
 	m.repair()
 	if rc := m.applyTo(m.committed()); rc != rcOK {
@@ -617,7 +648,7 @@ func (m *mpState) lock() int {
 
 func (m *mpState) unlock() {
 	m.applyMu.Unlock()
-	byteUnlock(m.lockF, lockPublish)
+	byteUnlock(m.byteF, lockPublish)
 	m.pubMu.Unlock()
 }
 
@@ -811,10 +842,10 @@ func (db *mwDB) compactMP() (CompactResult, error) {
 	}
 	db.compactMu.Lock()
 	defer db.compactMu.Unlock()
-	if !byteLock(m.lockF, lockCompact, false) {
+	if !byteLock(m.byteF, lockCompact, false) {
 		return out, nil // another process is compacting
 	}
-	defer byteUnlock(m.lockF, lockCompact)
+	defer byteUnlock(m.byteF, lockCompact)
 
 	// no collection until the pages and the size of T are copied: it could drop the versions of T (a collection
 	// only keeps the newest version at or below the oldest snapshot, which may move past T meanwhile)

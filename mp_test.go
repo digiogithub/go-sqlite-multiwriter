@@ -22,6 +22,11 @@ func mpOpts() Options { return Options{MultiProcess: true} }
 
 // child processes: MW_MP_CHILD=<role>, MW_MP_DB, MW_MP_ID, MW_MP_N, MW_MP_ACK
 func TestMain(m *testing.M) {
+	// MW_SEPARATE_BYTE_LOCKS=1 runs the multi-process tests (children included) with the fcntl byte locks on their
+	// own file, the layout of the platforms where flock and fcntl locks interact, on any unix.
+	if os.Getenv("MW_SEPARATE_BYTE_LOCKS") == "1" {
+		separateByteLocks = true
+	}
 	if role := os.Getenv("MW_MP_CHILD"); role != "" {
 		os.Exit(mpChild(role))
 	}

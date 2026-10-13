@@ -148,7 +148,8 @@ db, err := multiwriter.Open("app.db", multiwriter.Options{MultiProcess: true})
 
 Every process must open the database in multi-process mode (`mw_mp=1`); a process that opens it the other way
 while it is open is refused. The first process to open recovers the log; the last one to close
-compacts everything into the `.db` and removes the shared files (`<db>-mw*`, `<db>-mwlock`). A process killed at
+compacts everything into the `.db` and removes the shared files (`<db>-mw*`, `<db>-mwlock`, and on macOS and the
+BSDs `<db>-mwfcntl`, where the cross-process byte locks live because flock and fcntl locks interact there). A process killed at
 any point (even in the middle of a commit) leaves nothing to repair by hand: the others carry on, and acknowledged
 commits are never lost.
 
